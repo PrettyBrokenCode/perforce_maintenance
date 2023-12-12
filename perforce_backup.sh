@@ -481,6 +481,7 @@ function nightly_backup() {
 	rm -f "${JOURNAL_BACKUP_FILE_WITHOUT_GZ}"
 
 	# 4. Trim down amount of checkpoints stored locally on the server
+	# @TODO: IMPLEMENT
 	
 
 	# 5. Backup
