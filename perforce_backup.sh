@@ -1,10 +1,11 @@
 #!/bin/bash
 
-TEMP=$(getopt -o n,w,t: -l gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,u: -l verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket: -- "$@")
 if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
 
 eval set -- "$TEMP"
 
+VERBOSE=0
 NIGHTLY=0
 WEEKLY=0
 TICKET=-1
@@ -14,11 +15,26 @@ GCLOUD_BUCKET=-1
 GCLOUD_PROJECT=-1
 GCLOUD_BACKUP_ROLE=CloudBackupRole
 GCLOUD_BACKUP_USER=-1
+NOTIFICATION_RECIPIENTS=-1
+MAINTINANCE_USER=SuperUser
+
 while true; do
     case "$1" in
         -n|--nightly) NIGHTLY=1; shift ;;
         -w|--weekly) WEEKLY=1; shift ;;
 		--gcloud_setup) GCLOUD_SETUP=1; shift ;;
+		-v|--verbose) VERBOSE=1; shift ;;
+	-m|--mail)
+		case $2 in
+			"") echo "No mail provided, discarding parameter"; shift 2 ;;
+			*) NOTIFICATION_RECIPIENTS="$2"; shift 2 ;;
+		esac ;;
+	-u|--p4_user)
+		case $2 in
+			"") echo "No p4 user provided, discarding parameter"; shift 2 ;;
+			*) MAINTINANCE_USER="$2"; shift 2 ;;
+		esac ;;
+
 	-t|--ticket) 
 		case $2 in
 			"") echo "No ticket provided, using default ticket"; shift 2 ;;
@@ -60,10 +76,8 @@ if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 ]]; then
 	exit -1
 fi
 
-MAINTINANCE_USER=SuperUser
 ETH_ADAPTER=eth0
 export P4PASSWD="$TICKET"
-NOTIFICATION_RECIPIENTS=""
 export P4ROOT=/mnt/PerforceLive/root
 IP_ADDR=`ip a s ${ETH_ADAPTER} | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
 export P4PORT=$IP_ADDR:1666
@@ -79,6 +93,13 @@ function force_exit() {
 	kill -s TERM $TOP_PID
 }
 
+function verbose_log() {
+	MESSAGE="$1"
+	if [[ "$VERBOSE" -ne 0 ]]; then
+		echo -e "$MESSAGE"
+	fi
+}
+
 function force_exit_msg() {
 	MESSAGE="$1"
 	sendmail "${MESSAGE}"
@@ -88,7 +109,12 @@ function force_exit_msg() {
 
 function sendmail() {
 	MESSAGE="$1"
-	echo -e "From: Perforce Server\nSubject: Perforce server backup failed\n\n${MESSAGE}" | ssmtp ${NOTIFICATION_RECIPIENTS}
+	# Verify that we have specified the notification recipient
+	if [[ "$NOTIFICATION_RECIPIENTS" != -1 ]]; then
+		echo -e "From: Perforce Server\nSubject: Perforce server backup failed\n\n${MESSAGE}" | ssmtp ${NOTIFICATION_RECIPIENTS}
+	else
+		verbose_log "No notification recipient specified, no mail sent"
+	fi
 }
 
 function safe_command() {
@@ -136,17 +162,16 @@ function contains_element() {
 # @param 2 if false, we are not operating in strict mode, and will not terminate the
 #       application if the config variable doesn't exist
 function get_p4config_value() {
-        # parse input
-        local CONFIG_VAR="$1"
-        local STRICT=true
-        if [[ $# == 2 ]]; then
-                STRICT=$2
-        fi
+	local CONFIG_VAR="$1"
+	local STRICT=true
+	if [[ $# == 2 ]]; then
+		STRICT=$2
+	fi
 
-        # Get config value
-        local CONFIG_OUTPUT=`p4 configure show ${CONFIG_VAR} 2>&1`
-        # if the above command output contains "No configurables have been set for server", then
-        # we it's a error. Can't use return value as it's always 0
+	# Get config value
+	local CONFIG_OUTPUT=`p4 configure show ${CONFIG_VAR} 2>&1`
+	# if the above command output contains "No configurables have been set for server", then
+	# we it's a error. Can't use return value as it's always 0
 
 	local ERROR_STRINGS=("Your session has expired, please login again."
 		"Perforce password (P4PASSWD) invalid or unset.")
@@ -162,13 +187,13 @@ function get_p4config_value() {
 		return -1
 	fi
 
-        # p4 configure show return multiple lines, with the hierarchy of how the variable was set, with the first
-        # output having the highest prioerty, so just get the first line and strip away everything before = sign
-        local OUTPUT_WITH_SOURCE=`cut -d "=" -f2- <<< ${CONFIG_OUTPUT} | head -n 1`
-        # now the variable might end with " (default)", " (configure)", " (-p)", (-v) or (serverid) to show
-        # where it comes from, strip that
-        echo ${OUTPUT_WITH_SOURCE%% (*)}
-        return 0
+	# p4 configure show return multiple lines, with the hierarchy of how the variable was set, with the first
+	# output having the highest prioerty, so just get the first line and strip away everything before = sign
+	local OUTPUT_WITH_SOURCE=`cut -d "=" -f2- <<< ${CONFIG_OUTPUT} | head -n 1`
+	# now the variable might end with " (default)", " (configure)", " (-p)", (-v) or (serverid) to show
+	# where it comes from, strip that
+	echo ${OUTPUT_WITH_SOURCE%% (*)}
+	return 0
 }
 
 function check_returncode_with_msg() {
@@ -181,31 +206,63 @@ function check_returncode_with_msg() {
 }
 
 function get_backup_account_mail() {
+	require_param "GCLOUD_BACKUP_USER" "--gcloud_backup_user"
+	require_param "GCLOUD_PROJECT" "--gcloud_project"
+
 	echo "${GCLOUD_BACKUP_USER}@${GCLOUD_PROJECT}.iam.gserviceaccount.com"
 }
 
 function get_backup_role_absolute_path() {
+	require_param "GCLOUD_PROJECT" "--gcloud_project"
+	require_param "GCLOUD_BACKUP_ROLE" "--gcloud_backup_role"
+
 	echo "projects/${GCLOUD_PROJECT}/roles/${GCLOUD_BACKUP_ROLE}"
 }
 
+# from https://stackoverflow.com/a/62757929
+function callstack() { 
+	local i=1 max_depth=-1 line file func skip_first
+	# First parameter determines how many layers of callers we want to skip at start
+	if [[ "$#" -ge 1 ]]; then
+		i="$1"
+	fi
+	if [[ "$#" -ge 2 ]]; then
+		max_depth="$2"
+	fi
 
-if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
-	echo "Running SETUP"
-	if [[ "${GCLOUD_USER}" == "-1" ]]; then
-		force_exit_msg "gcloud_setup failed: --gcloud_setup requires --gcloud_user to be passed"
+	while read -r line func file < <(caller $i); do
+		echo >&2 "[$i] $file:$line $func(): $(sed -n ${line}p $file)"
+
+		if [[ "$max_depth" -ne "-1" && "$i" -ge "$max_depth" ]]; then
+			break
+		fi
+
+		((i++))
+	done
+}
+
+function from_func() {
+	cut -d ' ' -f 2 <<< `caller 1`
+}
+
+function require_param() {
+	local VARNAME="$1"
+	local PARAMETER_NAME="$2"
+
+	if [[ "${!VARNAME}" == "-1" ]]; then
+		force_exit_msg "$(from_func) failed: reqires ${PARAMETER_NAME} to be passed"
 	fi
-	if [[ "${GCLOUD_PROJECT}" == "-1" ]]; then
-		force_exit_msg "gcloud_setup failed: --gcloud_setup requires --gcloud_project to be passed"
-	fi
-	if [[ "${GCLOUD_BUCKET}" == "-1" ]]; then
-		force_exit_msg "gcloud_setup failed: --gcloud_setup requires --gcloud_bucket to be passed"
-	fi
-	if [[ "${GCLOUD_BACKUP_USER}" == "-1" ]]; then
-		force_exit_msg "gcloud_setup failed: --gcloud_setup requires --gcloud_backup_user to be passed"
-	fi
-	if [[ "${GCLOUD_BACKUP_ROLE}" == "-1" ]]; then
-		force_exit_msg "gcloud_setup failed: --gcloud_setup requires --gcloud_backup_role to be passed"
-	fi
+}
+
+
+function gcloud_setup() {
+	verbose_log "Running SETUP"
+
+	require_param "GCLOUD_USER"			"--gcloud_user"
+	require_param "GCLOUD_PROJECT"		"--gcloud_project"
+	require_param "GCLOUD_BUCKET" 		"--gcloud_bucket"
+	require_param "GCLOUD_BACKUP_USER" 	"--gcloud_backup_user"
+	require_param "GCLOUD_BACKUP_ROLE" 	"--gcloud_backup_role"
 
 	declare -I GCLOUD_OUTPUT
 
@@ -283,17 +340,19 @@ if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	fi
 
 	force_exit
-fi
+}
 
-if [[ "$NIGHTLY" -eq 1 ]]; then
+function nightly_backup() {
 	# Reference: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-procedure.html
 	# Nightly backup
-	# 1. Make checkpoint
-	CHECKPOINT_OUTPUT=`p4d -jc -z 2>&1`
+
+	require_param "GCLOUD_PROJECT" "--gcloud_project"
+	
+	# 1. Make checkpoint and ensure that it was successful
+	verbose_log "Making checkpoint..."
+	CHECKPOINT_OUTPUT=$(safe_command "p4d -jc -z" true)
 
 	# 2. Ensure the checkpointing was successful
-	check_returncode_with_msg $? "Failed to make a checkpoint, output was\n${CHECKPOINT_OUTPUT}"
-
 	PARSE_MD5_SED_CMD='s/^MD5 \(.+\) = (.+)$/\1/p'
 
 	JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< ${CHECKPOINT_OUTPUT}`
@@ -304,9 +363,9 @@ if [[ "$NIGHTLY" -eq 1 ]]; then
 	JOURNAL_PREFIX=$(get_p4config_value journalPrefix)
 	JOURNAL_DIR="${JOURNAL_FILE%/*}"
 	
+	verbose_log "Validating journal file was correctly written to disk..."
 	# Validate journal file
-	VALIDATE_JOURNAL_OUTPUT=`p4d -jv "${P4ROOT}/${JOURNAL_BACKUP_FILE}" 2>&1`
-	check_returncode_with_msg $? "Failed validating journal backup, output was:\n${VALIDATE_JOURNAL_OUTPUT}"
+	safe_command "p4d -jv \"${P4ROOT}/${JOURNAL_BACKUP_FILE}\"" false
 	# 3. Confirm checkpoint was correctly written to disk with md5
 	gzip -dk "${P4ROOT}/${JOURNAL_BACKUP_FILE}"
 
@@ -319,7 +378,7 @@ if [[ "$NIGHTLY" -eq 1 ]]; then
 	MD5_OF_CHECKPOINT=`md5sum ${JOURNAL_BACKUP_FILE_WITHOUT_GZ} | awk '{print $1}'`
 
 	if [[ "${MD5_OF_CHECKPOINT^^}" != "${MD5_FILE_CONTENT^^}" ]]; then
-	force_exit_msg "Checkpoint file has become corrupted during write! Aborting backup"
+		force_exit_msg "Checkpoint file has become corrupted during write! Aborting backup"
 	fi
 
 	# Remove the extracted file that we used to verify the md5 of
@@ -330,8 +389,9 @@ if [[ "$NIGHTLY" -eq 1 ]]; then
 
 	# 5. Backup
 	# Set correct project in google cloud
-	GCLOUD_OUTPUT=`gcloud config set project ninjagarden-406616 2>&1`
-	check_returncode_with_msg "$?" "Failed to set project id in gcloud with error\n${GCLOUD_OUTPUT}"
+	verbose_log "Sending backup to google cloud..."
+	safe_gcloud "config set project ${GCLOUD_PROJECT}"
+	#gcloud_safe "config set project ${GCLOUD_PROJECT}"
 
 	#GSUTIL_OUTPUT=$(gsutil -m rsync -d -r "${P4ROOT}/${JOURNAL_DIR}" gs://feeblemindstestbackup/journals 2>&1)
 	#check_returncode_with_msg "$?" "Backup to gcloud failed with error:\n ${GSUTIL_OUTPUT}"
@@ -342,7 +402,15 @@ if [[ "$NIGHTLY" -eq 1 ]]; then
 	#	versioned files
 	# 6. backup the server.id
 
-	echo "Nightly backup succeeded"
+	verbose_log "Nightly backup succeeded"
+}
+
+if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
+	gcloud_setup
+fi
+
+if [[ "$NIGHTLY" -eq 1 ]]; then
+	nightly_backup
 fi
 
 if [[ "$WEEKLY" -eq 1 ]]; then
