@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u:,r -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -19,6 +19,7 @@ NO_REVOKE=0
 NIGHTLY=0
 WEEKLY=0
 SETUP=0
+RESTORE=0
 
 MAIL_SENDER=-1
 MAIL_TOKEN=-1
@@ -39,6 +40,7 @@ while true; do
 		-v|--verbose) VERBOSE=1; shift ;;
 		--no_revoke) NO_REVOKE=1; shift ;;
 		-s|--setup) SETUP=1; shift ;;
+		-r|--restore) RESTORE=1; shift ;;
 	-m|--mail)
 		case $2 in
 			"") echo "No mail provided, discarding parameter"; shift 2 ;;
@@ -99,12 +101,13 @@ while true; do
     esac
 done
 
-if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 && "$SETUP" -eq 0 ]]; then
-	echoerr "Either nightly, weekly, setup or weekly_setup needs to be set for the backupscript to run"
+if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 && "$SETUP" -eq 0 && "$RESTORE" -eq 0 ]]; then
+	echoerr "Either nightly, weekly, setup, restore or weekly_setup needs to be set for the backupscript to run"
 	echoerr "EXITING!"
 	exit -1
 fi
 
+# @TODO: Move all variables that's export into the call of perforce instead of using environment variables and make helper function p4 and safe_p4
 ETH_ADAPTER=eth0
 export P4PASSWD="$TICKET"
 IP_ADDR=`ip a s ${ETH_ADAPTER} | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
@@ -509,6 +512,10 @@ function weekly_verification() {
 	verbose_log "Weekly verification succeeded"
 }
 
+function restore() {
+	verbose_log "Running RESTORE"
+}
+
 function setup() {
 	require_param "MAIL_SENDER" "--mail_sender"
 	require_param "MAIL_TOKEN" "--mail_token"
@@ -548,7 +555,7 @@ function setup() {
 	chown root:mail /etc/ssmtp/ssmtp.conf
 	chmod 640 /etc/ssmtp/ssmtp.conf
 
-	
+	# @TODO: Setup when backupscripts is run, move the backupscript into place etc
 }
 
 if [[ "$SETUP" -eq 1 ]]; then
@@ -557,6 +564,10 @@ fi
 
 if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	gcloud_setup
+fi
+
+if [[ "$RESTORE" -eq 1 ]]; then
+	restore
 fi
 
 if [[ "$NIGHTLY" -eq 1 ]]; then
