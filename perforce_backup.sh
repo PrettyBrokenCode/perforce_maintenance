@@ -1,22 +1,27 @@
 #!/bin/bash
 
-TEMP=$(getopt -o v,m,n,w,t:,u: -l verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,u: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket: -- "$@")
 if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
 
 eval set -- "$TEMP"
 
+NOTIFICATION_RECIPIENTS=-1
+MAINTINANCE_USER=SuperUser
+TICKET=-1
+
 VERBOSE=0
+NO_REVOKE=0
+
 NIGHTLY=0
 WEEKLY=0
-TICKET=-1
+
 GCLOUD_SETUP=0
+
 GCLOUD_USER=-1
 GCLOUD_BUCKET=-1
 GCLOUD_PROJECT=-1
 GCLOUD_BACKUP_ROLE=CloudBackupRole
 GCLOUD_BACKUP_USER=-1
-NOTIFICATION_RECIPIENTS=-1
-MAINTINANCE_USER=SuperUser
 
 while true; do
     case "$1" in
@@ -24,6 +29,7 @@ while true; do
         -w|--weekly) WEEKLY=1; shift ;;
 		--gcloud_setup) GCLOUD_SETUP=1; shift ;;
 		-v|--verbose) VERBOSE=1; shift ;;
+		--no_revoke) NO_REVOKE=1; shift ;;
 	-m|--mail)
 		case $2 in
 			"") echo "No mail provided, discarding parameter"; shift 2 ;;
@@ -78,7 +84,6 @@ fi
 
 ETH_ADAPTER=eth0
 export P4PASSWD="$TICKET"
-export P4ROOT=/mnt/PerforceLive/root
 IP_ADDR=`ip a s ${ETH_ADAPTER} | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
 export P4PORT=$IP_ADDR:1666
 export P4USER=$MAINTINANCE_USER
@@ -326,16 +331,19 @@ function gcloud_setup() {
 	fi
 
 	# The required permission of the backup role
-	#local REQUIRED_PERMISSIONS=
+	local REQUIRED_PERMISSIONS="storage.objects.list,storage.objects.create,storage.objects.delete,storage.objects.get"
 
 	# Check if the role exists
 	gcloud iam roles describe ${GCLOUD_BACKUP_ROLE} --project=${GCLOUD_PROJECT} > /dev/null
 	
 	# If the backup role doesn't exist, create it
 	if [[ "$?" -eq "1" ]]; then
-		safe_gcloud "iam roles create ${GCLOUD_BACKUP_ROLE} --project=${GCLOUD_PROJECT}" true
+		# @TODO: Verify that permissions are set correctly
+		verbose_log "Creating backup role with correct permissions"
+		safe_gcloud "iam roles create $GCLOUD_BACKUP_ROLE --project=$GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
 	else
-		echo "@TODO: Ensure that the role has the correct permissions"
+		verbose_log "Updating backup role with correct permissions"
+		safe_gcloud "iam roles update $GCLOUD_BACKUP_ROLE --project=$GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
 	fi
 
 	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(get_backup_account_mail) 2>&1`
@@ -374,8 +382,10 @@ function gcloud_setup() {
 		chmod 600 /opt/perforce/backup_key.json
 	fi
 
-	# Revoke our credentials so that they don't stay on the server by accident
-	safe_gcloud "auth revoke ${GCLOUD_USER}"
+	if [[ "$NO_REVOKE" -ne "0" ]]; then
+		# Revoke our credentials so that they don't stay on the server by accident
+		safe_gcloud "auth revoke ${GCLOUD_USER}"
+	fi
 
 	force_exit
 }
@@ -385,6 +395,16 @@ function nightly_backup() {
 	# Nightly backup
 
 	require_param "GCLOUD_PROJECT" "--gcloud_project"
+	require_param "GCLOUD_BUCKET" "--gcloud_bucket"
+
+	P4ROOT=$(get_p4config_value P4ROOT)
+	eval "export P4ROOT=$P4ROOT"
+
+	JOURNAL_FILE=$(get_p4config_value P4JOURNAL)
+	JOURNAL_PREFIX=$(get_p4config_value journalPrefix)
+	JOURNAL_DIR="${JOURNAL_FILE%/*}"
+
+	ARCHIVES_DIR=$(get_p4config_value server.depot.root)
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
@@ -395,11 +415,6 @@ function nightly_backup() {
 
 	JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< ${CHECKPOINT_OUTPUT}`
 	CHECKPOINT_REPORTED_MD5=`sed -nE "${PARSE_MD5_SED_CMD}" <<< ${CHECKPOINT_OUTPUT}`
-
-	JOURNAL_FILE=$(get_p4config_value P4JOURNAL)
-
-	JOURNAL_PREFIX=$(get_p4config_value journalPrefix)
-	JOURNAL_DIR="${JOURNAL_FILE%/*}"
 	
 	verbose_log "Validating journal file was correctly written to disk..."
 	# Validate journal file
@@ -427,19 +442,23 @@ function nightly_backup() {
 
 	# 5. Backup
 	# Set correct project in google cloud
-	verbose_log "Sending backup to google cloud..."
+	verbose_log "Authenticating with google cloud storage..."
 	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(backup_account_cred_file)" true
 	safe_gcloud "config set project ${GCLOUD_PROJECT}"
-	#gcloud_safe "config set project ${GCLOUD_PROJECT}"
 
-	#GSUTIL_OUTPUT=$(gsutil -m rsync -d -r "${P4ROOT}/${JOURNAL_DIR}" gs://feeblemindstestbackup/journals 2>&1)
-	#check_returncode_with_msg "$?" "Backup to gcloud failed with error:\n ${GSUTIL_OUTPUT}"
-	#echo "GSUTIL_OUTPUT=${GSUTIL_OUTPUT}"
-	# 	checkpoint + md5
-	#	rotated journal file
+	verbose_log "Sending journals and checkpoints to google cloud..."
+	# 	checkpoint + md5, rotated journal file
+	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${JOURNAL_DIR}" gs://${GCLOUD_BUCKET}/journals" true
 	#	license file
+	verbose_log "Sending license to google cloud..."
+	safe_gcloud "storage cp "${P4ROOT}/license" gs://${GCLOUD_BUCKET}/license" true
 	#	versioned files
+	verbose_log "Sending content to google cloud..."
+	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${ARCHIVES_DIR}" gs://${GCLOUD_BUCKET}/archives" true
+
 	# 6. backup the server.id
+	verbose_log "Sending server.id to google cloud..."
+	safe_gcloud "storage cp "${P4ROOT}/server.id" gs://${GCLOUD_BUCKET}/server.id" true
 
 	verbose_log "Nightly backup succeeded"
 }
