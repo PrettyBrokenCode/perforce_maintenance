@@ -7,7 +7,7 @@ eval set -- "$TEMP"
 
 NIGHTLY=0
 WEEKLY=0
-TICKET=76A9F079C69FB1E444EF5A4F4A9049C6
+TICKET=-1
 GCLOUD_SETUP=0
 GCLOUD_USER=-1
 GCLOUD_BUCKET=-1
@@ -180,6 +180,14 @@ function check_returncode_with_msg() {
 	fi
 }
 
+function get_backup_account_mail() {
+	echo "${GCLOUD_BACKUP_USER}@${GCLOUD_PROJECT}.iam.gserviceaccount.com"
+}
+
+function get_backup_role_absolute_path() {
+	echo "projects/${GCLOUD_PROJECT}/roles/${GCLOUD_BACKUP_ROLE}"
+}
+
 
 if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	echo "Running SETUP"
@@ -195,14 +203,17 @@ if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	if [[ "${GCLOUD_BACKUP_USER}" == "-1" ]]; then
 		force_exit_msg "gcloud_setup failed: --gcloud_setup requires --gcloud_backup_user to be passed"
 	fi
+	if [[ "${GCLOUD_BACKUP_ROLE}" == "-1" ]]; then
+		force_exit_msg "gcloud_setup failed: --gcloud_setup requires --gcloud_backup_role to be passed"
+	fi
 
 	declare -I GCLOUD_OUTPUT
 
 	# Check if the user is already logged in
-	GCLOUD_OUTPUT=$(safe_gcloud "auth list --filter-account=${GCLOUD_USER}" true)
+	GCLOUD_OUTPUT=$(safe_gcloud "auth list --filter-account=${GCLOUD_USER} --format=json" true)
 
 	# Need to login, so run interactive prompt (don't use safe_gcloud or safe_command)
-	if [[ "${GCLOUD_OUTPUT}" == *"No credentialed accounts."* ]]; then
+	if  [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
 		gcloud auth login ${GCLOUD_USER}
 		check_returncode_with_msg "$?" "gcloud_setup failed: Failed to login"
 	else
@@ -212,20 +223,25 @@ if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 
 	# Ensure that we are working on the correct project
 	GCLOUD_OUTPUT=$(safe_gcloud "config set project ${GCLOUD_PROJECT}" true)
+
 	if [[ "${GCLOUD_OUTPUT}" == *"WARNING: You do not appear to have access to project [${GCLOUD_PROJECT}] or it does not exist."* ]]; then
 		force_exit_msg "gcloud_setup failed: You don't have permission or the project ${GCLOUD_PROJECT} doesn't exist: Error: \n'${GCLOUD_OUTPUT}'"
 	fi
 
 	# check if the bucket exists
-	GCLOUD_OUTPUT=$(safe_gcloud "storage buckets list --filter=${GCLOUD_BUCKET}")
+	GCLOUD_OUTPUT=$(safe_gcloud "storage buckets list --filter=${GCLOUD_BUCKET} --format=json" true)
+
 	# Bucket doesn't exist, create it
-	if [[ "$GCLOUD_OUTPUT" == *"Listed 0 items."* ]]; then
+	if  [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
+		echo "Creating bucket"
 		safe_gcloud "storage buckets create gs://${GCLOUD_BUCKET}/ \
 		--uniform-bucket-level-access \
 		--default-storage-class=Standard \
 		--location=EUROPE-NORTH1 \
 		--pap \
 		2>&1" true
+	else
+		echo "Skipping creating bucket, as it already exists"
 	fi
 
 	# The required permission of the backup role
@@ -238,15 +254,34 @@ if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	if [[ "$?" -eq "1" ]]; then
 		safe_gcloud "iam roles create ${GCLOUD_BACKUP_ROLE} --project=${GCLOUD_PROJECT}" true
 	else
-		echo "Ensure that the role has the correct permissions"
+		echo "@TODO: Ensure that the role has the correct permissions"
 	fi
 
-	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json` # --filter=${GCLOUD_BACKUP_USER} 2>&1`
-	#if [[ "$GCLOUD_OUTPUT" == "Listed 0 items." ]]
-	echo "GCLOUD_OUTPUT WAS '${GCLOUD_OUTPUT}' RESULT WAS $?"
+	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(get_backup_account_mail) 2>&1`
 
-	#safe_gcloud "auth login --cred-file=/etc/backup/creds/perforce_backup.json 2>&1" true 
-	#safe_gcloud "config set project ninjagarden-406616" true
+	if [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
+		# User doesn't exist, create it
+		safe_gcloud "iam service-accounts create ${GCLOUD_BACKUP_USER} --display-name=\"Perforce backup user\"" true
+	else
+		echo "@TODO: Updating service account"
+	fi
+
+	# Get the roles of the service account to verify that the service account has the correct role
+	GCLOUD_OUTPUT=$(safe_gcloud "projects get-iam-policy ${GCLOUD_PROJECT} --flatten='bindings[].members' \
+		--format='table(bindings.role)' \
+		--filter='bindings.members:serviceAccount:$(get_backup_account_mail) AND \
+			bindings.role=$(get_backup_role_absolute_path)' --format=json" true)
+
+	if [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
+		# Add the role to the service account
+		echo "Adding the role projects/${GCLOUD_PROJECT}/roles/${GCLOUD_BACKUP_ROLE} to backup user"
+		safe_gcloud "projects add-iam-policy-binding ${GCLOUD_PROJECT} \
+			--role=$(get_backup_role_absolute_path) \
+			--member=serviceAccount:$(get_backup_account_mail)" true
+	else
+		echo "Skipping adding role to backup user, as it already has it"
+	fi
+
 	force_exit
 fi
 
