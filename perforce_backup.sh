@@ -75,13 +75,13 @@ while true; do
 		*) GCLOUD_BACKUP_USER="$2"; shift 2 ;;
 		esac ;;
 	--) shift ; break ;;
-        *) echo "Internal error!" ; exit 1 ;;
+        *) echoerr "Internal error!" ; exit 1 ;;
     esac
 done
 
 if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 ]]; then
-	echo "Either nightly, weekly or setup needs to be set for the backupscript to run"
-	echo "EXITING!"
+	echoerr "Either nightly, weekly or setup needs to be set for the backupscript to run"
+	echoerr "EXITING!"
 	exit -1
 fi
 
@@ -319,7 +319,7 @@ function gcloud_setup() {
 
 	# Bucket doesn't exist, create it
 	if  [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
-		echo "Creating bucket"
+		verbose_log "Creating bucket"
 		safe_gcloud "storage buckets create gs://${GCLOUD_BUCKET}/ \
 		--uniform-bucket-level-access \
 		--default-storage-class=Standard \
@@ -327,7 +327,7 @@ function gcloud_setup() {
 		--pap \
 		2>&1" true
 	else
-		echo "Skipping creating bucket, as it already exists"
+		verbose_log "Skipping creating bucket, as it already exists"
 	fi
 
 	# The required permission of the backup role
@@ -352,7 +352,7 @@ function gcloud_setup() {
 		# User doesn't exist, create it
 		safe_gcloud "iam service-accounts create ${GCLOUD_BACKUP_USER} --display-name=\"Perforce backup user\"" true
 	else
-		echo "@TODO: Updating service account"
+		verbose_log	"Skipping creating service account as it already exists"
 	fi
 
 	# Get the roles of the service account to verify that the service account has the correct role
@@ -368,10 +368,11 @@ function gcloud_setup() {
 			--role=$(get_backup_role_absolute_path) \
 			--member=serviceAccount:$(get_backup_account_mail)" true
 	else
-		echo "Skipping adding role to backup user, as it already has it"
+		verbose_log "Skipping adding role to backup user, as it already has it"
 	fi
 
 	if [[ ! -d /opt/perforce ]]; then
+		verbose_log	"Creating /opt/perforce if it doesn't exist"
 		safe_command "mkdir /opt/perforce/" true
 	fi
 
@@ -380,6 +381,8 @@ function gcloud_setup() {
 		verbose_log "Downloading credentials file for service-account"
 		safe_gcloud "iam service-accounts keys create $(backup_account_cred_file) --iam-account=$(get_backup_account_mail)" true
 		chmod 600 /opt/perforce/backup_key.json
+	else
+		verbose_log "Skipping downloading of credentials as it's already downloaded"
 	fi
 
 	if [[ "$NO_REVOKE" -ne "0" ]]; then
@@ -400,24 +403,24 @@ function nightly_backup() {
 	require_param "TICKET" "-t|--ticket"
 
 
-	P4ROOT=$(get_p4config_value P4ROOT)
+	local P4ROOT=$(get_p4config_value P4ROOT)
 	eval "export P4ROOT=$P4ROOT"
 
-	JOURNAL_FILE=$(get_p4config_value P4JOURNAL)
-	JOURNAL_PREFIX=$(get_p4config_value journalPrefix)
-	JOURNAL_DIR="${JOURNAL_FILE%/*}"
+	local JOURNAL_FILE=$(get_p4config_value P4JOURNAL)
+	local JOURNAL_PREFIX=$(get_p4config_value journalPrefix)
+	local JOURNAL_DIR="${JOURNAL_FILE%/*}"
 
-	ARCHIVES_DIR=$(get_p4config_value server.depot.root)
+	local ARCHIVES_DIR=$(get_p4config_value server.depot.root)
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
-	CHECKPOINT_OUTPUT=$(safe_command "p4d -jc -z" true)
+	local CHECKPOINT_OUTPUT=$(safe_command "p4d -jc -z" true)
 
 	# 2. Ensure the checkpointing was successful
-	PARSE_MD5_SED_CMD='s/^MD5 \(.+\) = (.+)$/\1/p'
+	local PARSE_MD5_SED_CMD='s/^MD5 \(.+\) = (.+)$/\1/p'
 
-	JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< ${CHECKPOINT_OUTPUT}`
-	CHECKPOINT_REPORTED_MD5=`sed -nE "${PARSE_MD5_SED_CMD}" <<< ${CHECKPOINT_OUTPUT}`
+	local JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< ${CHECKPOINT_OUTPUT}`
+	local CHECKPOINT_REPORTED_MD5=`sed -nE "${PARSE_MD5_SED_CMD}" <<< ${CHECKPOINT_OUTPUT}`
 	
 	verbose_log "Validating journal file was correctly written to disk..."
 	# Validate journal file
@@ -425,13 +428,13 @@ function nightly_backup() {
 	# 3. Confirm checkpoint was correctly written to disk with md5
 	gzip -dk "${P4ROOT}/${JOURNAL_BACKUP_FILE}"
 
-	JOURNAL_BACKUP_FILE_WITHOUT_GZ=${P4ROOT}/${JOURNAL_BACKUP_FILE%.gz}
-	MD5_FILE_CONTENT=`cat "${JOURNAL_BACKUP_FILE_WITHOUT_GZ}.md5" | sed -nE "${PARSE_MD5_SED_CMD}"`
+	local JOURNAL_BACKUP_FILE_WITHOUT_GZ=${P4ROOT}/${JOURNAL_BACKUP_FILE%.gz}
+	local MD5_FILE_CONTENT=`cat "${JOURNAL_BACKUP_FILE_WITHOUT_GZ}.md5" | sed -nE "${PARSE_MD5_SED_CMD}"`
 	if [[ "${MD5_FILE_CONTENT^^}" != "${CHECKPOINT_REPORTED_MD5^^}" ]]; then
 		force_exit_msg "MD5 file has become corrupted during write! Aborting backup"
 	fi
 
-	MD5_OF_CHECKPOINT=`md5sum ${JOURNAL_BACKUP_FILE_WITHOUT_GZ} | awk '{print $1}'`
+	local MD5_OF_CHECKPOINT=`md5sum ${JOURNAL_BACKUP_FILE_WITHOUT_GZ} | awk '{print $1}'`
 
 	if [[ "${MD5_OF_CHECKPOINT^^}" != "${MD5_FILE_CONTENT^^}" ]]; then
 		force_exit_msg "Checkpoint file has become corrupted during write! Aborting backup"
