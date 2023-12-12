@@ -277,7 +277,7 @@ function require_param() {
 	local VARNAME="$1"
 	local PARAMETER_NAME="$2"
 
-	if [[ "${!VARNAME}" == "-1" ]]; then
+	if [[ "${!VARNAME}" == "-1" || "${!VARNAME}" == "" ]]; then
 		force_exit_msg "$(from_func) failed: reqires ${PARAMETER_NAME} to be passed"
 	fi
 }
@@ -396,6 +396,9 @@ function nightly_backup() {
 
 	require_param "GCLOUD_PROJECT" "--gcloud_project"
 	require_param "GCLOUD_BUCKET" "--gcloud_bucket"
+	require_param "GCLOUD_BACKUP_USER" "--gcloud_backup_user"
+	require_param "TICKET" "-t|--ticket"
+
 
 	P4ROOT=$(get_p4config_value P4ROOT)
 	eval "export P4ROOT=$P4ROOT"
@@ -463,7 +466,9 @@ function nightly_backup() {
 	verbose_log "Nightly backup succeeded"
 }
 
-function weekly_backup() {
+function weekly_verification() {
+	require_param "TICKET" "-t|--ticket"
+
 	# 1. Verify archive files
 	safe_command "p4 verify -q //..."
 	# 2. Verify shelved files 
@@ -481,5 +486,5 @@ if [[ "$NIGHTLY" -eq 1 ]]; then
 fi
 
 if [[ "$WEEKLY" -eq 1 ]]; then
-	weekly_backup
+	weekly_verification
 fi
