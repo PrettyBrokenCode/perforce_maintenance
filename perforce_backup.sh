@@ -94,21 +94,34 @@ function force_exit() {
 }
 
 function verbose_log() {
-	MESSAGE="$1"
+	local MESSAGE="$1"
 	if [[ "$VERBOSE" -ne 0 ]]; then
 		echo -e "$MESSAGE"
 	fi
 }
 
 function force_exit_msg() {
-	MESSAGE="$1"
+	local MESSAGE="$1"
+
 	sendmail "${MESSAGE}"
 	echoerr "${MESSAGE}"
+
 	force_exit
 }
 
+function is_root() {
+	local OUTPUT=`whoami`
+
+	if [[ "${OUTPUT}" == "root" ]]; then
+		return 1
+	fi
+
+	return 0
+}
+
 function sendmail() {
-	MESSAGE="$1"
+	local MESSAGE="$1"
+
 	# Verify that we have specified the notification recipient
 	if [[ "$NOTIFICATION_RECIPIENTS" != -1 ]]; then
 		echo -e "From: Perforce Server\nSubject: Perforce server backup failed\n\n${MESSAGE}" | ssmtp ${NOTIFICATION_RECIPIENTS}
@@ -197,8 +210,8 @@ function get_p4config_value() {
 }
 
 function check_returncode_with_msg() {
-	RETURN_CODE=$1
-	ERROR_MESSAGE="$2"
+	local RETURN_CODE=$1
+	local ERROR_MESSAGE="$2"
 
 	if [[ "${RETURN_CODE}" -ne 0 ]]; then
 		force_exit_msg "${ERROR_MESSAGE}"
@@ -217,6 +230,10 @@ function get_backup_role_absolute_path() {
 	require_param "GCLOUD_BACKUP_ROLE" "--gcloud_backup_role"
 
 	echo "projects/${GCLOUD_PROJECT}/roles/${GCLOUD_BACKUP_ROLE}"
+}
+
+function backup_account_cred_file() {
+	echo "/opt/perforce/backup_key.json"
 }
 
 # from https://stackoverflow.com/a/62757929
@@ -239,6 +256,12 @@ function callstack() {
 
 		((i++))
 	done
+}
+
+function show_var() {
+	local VARNAME=$1
+
+	echo -e "${VARNAME}='${!VARNAME}'"
 }
 
 function from_func() {
@@ -270,10 +293,11 @@ function gcloud_setup() {
 	GCLOUD_OUTPUT=$(safe_gcloud "auth list --filter-account=${GCLOUD_USER} --format=json" true)
 
 	# Need to login, so run interactive prompt (don't use safe_gcloud or safe_command)
-	if  [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
+	if  [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq "0" ]]; then
 		gcloud auth login ${GCLOUD_USER}
 		check_returncode_with_msg "$?" "gcloud_setup failed: Failed to login"
 	else
+		verbose_log "Setting account ${GCLOUD_USER}"
 		# Set the active account
 		safe_gcloud "config set account ${GCLOUD_USER}" true
 	fi
@@ -331,13 +355,27 @@ function gcloud_setup() {
 
 	if [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
 		# Add the role to the service account
-		echo "Adding the role projects/${GCLOUD_PROJECT}/roles/${GCLOUD_BACKUP_ROLE} to backup user"
+		verbose_log "Adding the role $(get_backup_role_absolute_path) to backup user $(get_backup_account_mail)"
 		safe_gcloud "projects add-iam-policy-binding ${GCLOUD_PROJECT} \
 			--role=$(get_backup_role_absolute_path) \
 			--member=serviceAccount:$(get_backup_account_mail)" true
 	else
 		echo "Skipping adding role to backup user, as it already has it"
 	fi
+
+	if [[ ! -d /opt/perforce ]]; then
+		safe_command "mkdir /opt/perforce/" true
+	fi
+
+	# @TODO: Check if the key if for the current backup user, and if not, delete old key and download a new key
+	if [[ ! -f "$(backup_account_cred_file)" ]]; then
+		verbose_log "Downloading credentials file for service-account"
+		safe_gcloud "iam service-accounts keys create $(backup_account_cred_file) --iam-account=$(get_backup_account_mail)" true
+		chmod 600 /opt/perforce/backup_key.json
+	fi
+
+	# Revoke our credentials so that they don't stay on the server by accident
+	safe_gcloud "auth revoke ${GCLOUD_USER}"
 
 	force_exit
 }
@@ -390,6 +428,7 @@ function nightly_backup() {
 	# 5. Backup
 	# Set correct project in google cloud
 	verbose_log "Sending backup to google cloud..."
+	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(backup_account_cred_file)" true
 	safe_gcloud "config set project ${GCLOUD_PROJECT}"
 	#gcloud_safe "config set project ${GCLOUD_PROJECT}"
 
