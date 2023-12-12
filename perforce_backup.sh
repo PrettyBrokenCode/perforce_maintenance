@@ -1,7 +1,10 @@
 #!/bin/bash
 
+# ability to use echoerr "Error message" to print to stderr instead of stdout
+function echoerr() { echo -e "$@" 1>&2; }
+
 TEMP=$(getopt -o v,m,n,w,t:,u: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket: -- "$@")
-if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
+if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
 
@@ -159,9 +162,6 @@ function safe_gcloud() {
 
 	safe_command "gcloud $COMMAND -q" "${PRINT_RESULT}"
 }
-
-# ability to use echoerr "Error message" to print to stderr instead of stdout
-function echoerr() { echo -e "$@" 1>&2; }
 
 # checks if a element is present in a array. Ensure that both parameters passed in is enclosed
 #	in ""
