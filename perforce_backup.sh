@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name: -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -11,6 +11,7 @@ eval set -- "$TEMP"
 NOTIFICATION_RECIPIENTS=-1
 MAINTINANCE_USER=SuperUser
 TICKET=-1
+SERVER_NAME=-1
 
 VERBOSE=0
 NO_REVOKE=0
@@ -58,7 +59,11 @@ while true; do
 			"") echo "No p4 user provided, discarding parameter"; shift 2 ;;
 			*) MAINTINANCE_USER="$2"; shift 2 ;;
 		esac ;;
-
+	--server_name)
+		case $2 in
+			"") echo "No server name provided, discarding parameter"; shift 2 ;;
+			*) SERVER_NAME="$2"; shift 2 ;;
+		esac ;;
 	-t|--ticket) 
 		case $2 in
 			"") echo "No ticket provided, using default ticket"; shift 2 ;;
@@ -71,23 +76,23 @@ while true; do
 		esac ;;
 	--gcloud_bucket)
 		case $2 in
-		"") echo "No gcloud bucket provided, exiting"; exit -1; shift 2 ;;
-		*) GCLOUD_BUCKET="$2"; shift 2 ;;
+			"") echo "No gcloud bucket provided, exiting"; exit -1; shift 2 ;;
+			*) GCLOUD_BUCKET="$2"; shift 2 ;;
 		esac ;;
 	--gcloud_project)
 		case $2 in
-		"") echo "No gcloud provided provided, exiting"; exit -1; shift 2 ;;
-		*) GCLOUD_PROJECT="$2"; shift 2 ;;
+			"") echo "No gcloud provided provided, exiting"; exit -1; shift 2 ;;
+			*) GCLOUD_PROJECT="$2"; shift 2 ;;
 		esac ;;
 	--gcloud_backup_role)
 		case $2 in
-		"") echo "No gcloud backup role provided, exiting"; exit -1; shift 2 ;;
-		*) GCLOUD_BACKUP_ROLE="$2"; shift 2 ;;
+			"") echo "No gcloud backup role provided, exiting"; exit -1; shift 2 ;;
+			*) GCLOUD_BACKUP_ROLE="$2"; shift 2 ;;
 		esac ;;
 	--gcloud_backup_user)
 		case $2 in
-		"") echo "No gcloud backup user provided, exiting"; exit -1; shift 2 ;;
-		*) GCLOUD_BACKUP_USER="$2"; shift 2 ;;
+			"") echo "No gcloud backup user provided, exiting"; exit -1; shift 2 ;;
+			*) GCLOUD_BACKUP_USER="$2"; shift 2 ;;
 		esac ;;
 	--) shift ; break ;;
         *) echoerr "Internal error!" ; exit 1 ;;
@@ -426,6 +431,15 @@ function nightly_backup() {
 	local JOURNAL_DIR="${JOURNAL_FILE%/*}"
 
 	local ARCHIVES_DIR=$(get_p4config_value server.depot.root)
+
+	# If no --server_name was provided, then we set one
+	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
+		# For some reason, p4 configure show serverid doesn't work, even thou it shows up when running p4 configure show
+		SERVER_NAME=$(safe_command "cat $P4ROOT/server.id" true)
+	fi
+	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
+		force_exit_msg "No server name is set, please pass in --server_name to ensure that you know where your backup is stored"
+	fi
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
@@ -469,17 +483,17 @@ function nightly_backup() {
 
 	verbose_log "Sending journals and checkpoints to google cloud..."
 	# 	checkpoint + md5, rotated journal file
-	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${JOURNAL_DIR}" gs://${GCLOUD_BUCKET}/journals" true
+	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${JOURNAL_DIR}" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/journals" true
 	#	license file
 	verbose_log "Sending license to google cloud..."
-	safe_gcloud "storage cp "${P4ROOT}/license" gs://${GCLOUD_BUCKET}/license" true
+	safe_gcloud "storage cp "${P4ROOT}/license" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/license" true
 	#	versioned files
 	verbose_log "Sending content to google cloud..."
-	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${ARCHIVES_DIR}" gs://${GCLOUD_BUCKET}/archives" true
+	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${ARCHIVES_DIR}" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/archives" true
 
 	# 6. backup the server.id
 	verbose_log "Sending server.id to google cloud..."
-	safe_gcloud "storage cp "${P4ROOT}/server.id" gs://${GCLOUD_BUCKET}/server.id" true
+	safe_gcloud "storage cp "${P4ROOT}/server.id" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/server.id" true
 
 	verbose_log "Nightly backup succeeded"
 }
