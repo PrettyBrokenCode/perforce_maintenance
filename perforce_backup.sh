@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u:,r -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore: -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -33,75 +33,80 @@ GCLOUD_BACKUP_ROLE=CloudBackupRole
 GCLOUD_BACKUP_USER=-1
 
 while true; do
-    case "$1" in
-        -n|--nightly) NIGHTLY=1; shift ;;
-        -w|--weekly) WEEKLY=1; shift ;;
+	case "$1" in
+		-n|--nightly) NIGHTLY=1; shift ;;
+		-w|--weekly) WEEKLY=1; shift ;;
 		--gcloud_setup) GCLOUD_SETUP=1; shift ;;
 		-v|--verbose) VERBOSE=1; shift ;;
 		--no_revoke) NO_REVOKE=1; shift ;;
 		-s|--setup) SETUP=1; shift ;;
-		-r|--restore) RESTORE=1; shift ;;
-	-m|--mail)
-		case $2 in
-			"") echo "No mail provided, discarding parameter"; shift 2 ;;
-			*) NOTIFICATION_RECIPIENTS="$2"; shift 2 ;;
-		esac ;;
-	--mail_sender)
-		case $2 in
-			"") echo "No mail provided, discarding parameter"; shift 2 ;;
-			*) MAIL_SENDER="$2"; shift 2 ;;
-		esac ;;
-	--mail_token)
-		case $2 in
-			"") echo "No mail token provided, discarding parameter"; shift 2 ;;
-			*) MAIL_TOKEN="$2"; shift 2 ;;
-		esac ;;
-	-u|--p4_user)
-		case $2 in
-			"") echo "No p4 user provided, discarding parameter"; shift 2 ;;
-			*) MAINTINANCE_USER="$2"; shift 2 ;;
-		esac ;;
-	--server_name)
-		case $2 in
-			"") echo "No server name provided, discarding parameter"; shift 2 ;;
-			*) SERVER_NAME="$2"; shift 2 ;;
-		esac ;;
-	-t|--ticket) 
-		case $2 in
-			"") echo "No ticket provided, using default ticket"; shift 2 ;;
-			*) TICKET="$2"; shift 2 ;;
-		esac ;;
-	--gcloud_user)
-		case $2 in
-			"") echo "No gcloud user provided, exiting"; exit -1; shift 2 ;;
-			*) GCLOUD_USER="$2"; shift 2 ;;
-		esac ;;
-	--gcloud_bucket)
-		case $2 in
-			"") echo "No gcloud bucket provided, exiting"; exit -1; shift 2 ;;
-			*) GCLOUD_BUCKET="$2"; shift 2 ;;
-		esac ;;
-	--gcloud_project)
-		case $2 in
-			"") echo "No gcloud provided provided, exiting"; exit -1; shift 2 ;;
-			*) GCLOUD_PROJECT="$2"; shift 2 ;;
-		esac ;;
-	--gcloud_backup_role)
-		case $2 in
-			"") echo "No gcloud backup role provided, exiting"; exit -1; shift 2 ;;
-			*) GCLOUD_BACKUP_ROLE="$2"; shift 2 ;;
-		esac ;;
-	--gcloud_backup_user)
-		case $2 in
-			"") echo "No gcloud backup user provided, exiting"; exit -1; shift 2 ;;
-			*) GCLOUD_BACKUP_USER="$2"; shift 2 ;;
-		esac ;;
-	--) shift ; break ;;
-        *) echoerr "Internal error!" ; exit 1 ;;
+		-r|--restore)
+			case $2 in
+				"") force_exit_msg "No restore mode provided, please provide 'db' or 'db_and_files', EXITING"; shift 2 ;;
+				db|db_and_files) RESTORE="$2"; shift 2 ;;
+				*) force_exit_msg "Unknown restoration mode '$2', please provide 'db' or 'db_and_files', EXITING"; shift 2 ;;
+			esac ;;
+		-m|--mail)
+			case $2 in
+				"") echo "No mail provided, discarding parameter"; shift 2 ;;
+				*) NOTIFICATION_RECIPIENTS="$2"; shift 2 ;;
+			esac ;;
+		--mail_sender)
+			case $2 in
+				"") echo "No mail provided, discarding parameter"; shift 2 ;;
+				*) MAIL_SENDER="$2"; shift 2 ;;
+			esac ;;
+		--mail_token)
+			case $2 in
+				"") echo "No mail token provided, discarding parameter"; shift 2 ;;
+				*) MAIL_TOKEN="$2"; shift 2 ;;
+			esac ;;
+		-u|--p4_user)
+			case $2 in
+				"") echo "No p4 user provided, discarding parameter"; shift 2 ;;
+				*) MAINTINANCE_USER="$2"; shift 2 ;;
+			esac ;;
+		--server_name)
+			case $2 in
+				"") echo "No server name provided, discarding parameter"; shift 2 ;;
+				*) SERVER_NAME="$2"; shift 2 ;;
+			esac ;;
+		-t|--ticket) 
+			case $2 in
+				"") echo "No ticket provided, using default ticket"; shift 2 ;;
+				*) TICKET="$2"; shift 2 ;;
+			esac ;;
+		--gcloud_user)
+			case $2 in
+				"") echo "No gcloud user provided, exiting"; exit -1; shift 2 ;;
+				*) GCLOUD_USER="$2"; shift 2 ;;
+			esac ;;
+		--gcloud_bucket)
+			case $2 in
+				"") echo "No gcloud bucket provided, exiting"; exit -1; shift 2 ;;
+				*) GCLOUD_BUCKET="$2"; shift 2 ;;
+			esac ;;
+		--gcloud_project)
+			case $2 in
+				"") echo "No gcloud provided provided, exiting"; exit -1; shift 2 ;;
+				*) GCLOUD_PROJECT="$2"; shift 2 ;;
+			esac ;;
+		--gcloud_backup_role)
+			case $2 in
+				"") echo "No gcloud backup role provided, exiting"; exit -1; shift 2 ;;
+				*) GCLOUD_BACKUP_ROLE="$2"; shift 2 ;;
+			esac ;;
+		--gcloud_backup_user)
+			case $2 in
+				"") echo "No gcloud backup user provided, exiting"; exit -1; shift 2 ;;
+				*) GCLOUD_BACKUP_USER="$2"; shift 2 ;;
+			esac ;;
+		--) shift ; break ;;
+		*) echoerr "Internal error!, received unknown token '$1'" ; exit 1 ;;
     esac
 done
 
-if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 && "$SETUP" -eq 0 && "$RESTORE" -eq 0 ]]; then
+if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 && "$SETUP" -eq 0 && "$RESTORE" -ne 0 ]]; then
 	echoerr "Either nightly, weekly, setup, restore or weekly_setup needs to be set for the backupscript to run"
 	echoerr "EXITING!"
 	exit -1
@@ -512,8 +517,18 @@ function weekly_verification() {
 	verbose_log "Weekly verification succeeded"
 }
 
-function restore() {
-	verbose_log "Running RESTORE"
+function restore_db() {
+	# How to restore is specified here: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.database_corruption.html
+	force_exit_msg "restore_db not implemented yet"
+
+	# Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
+}
+
+function restore_db_and_files() {
+	# How to restore is specified here: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.damage.html
+	force_exit_msg "restore_db_and_files not implemented yet"
+
+	# Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
 }
 
 function setup() {
@@ -565,6 +580,15 @@ fi
 if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	gcloud_setup
 fi
+
+case "$RESTORE" in
+	db) 
+		restore_db ;;
+	db_and_files) 
+		restore_db_and_files ;;
+	*) 
+		force_exit_msg "Managed to pass in unknown restore mode... WTH!"
+esac
 
 if [[ "$RESTORE" -eq 1 ]]; then
 	restore
