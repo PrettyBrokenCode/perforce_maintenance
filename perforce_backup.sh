@@ -463,6 +463,15 @@ function nightly_backup() {
 	verbose_log "Nightly backup succeeded"
 }
 
+function weekly_backup() {
+	# 1. Verify archive files
+	safe_command "p4 verify -q //..."
+	# 2. Verify shelved files 
+	safe_command "p4 verify -q -S //..."
+
+	verbose_log "Weekly verification succeeded"
+}
+
 if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	gcloud_setup
 fi
@@ -472,15 +481,5 @@ if [[ "$NIGHTLY" -eq 1 ]]; then
 fi
 
 if [[ "$WEEKLY" -eq 1 ]]; then
-	# Recommended weekly verify
-	# 1. Verify archive files (p4 verify -q //...)
-	VERIFY_OUTPUT=$(p4 verify -q //... 2>&1)
-	RESULT=$?
-	check_returncode_with_msg ${RESULT} "Verifying files failed with errormessage:\n${VERIFY_OUTPUT}"
-	# 2. Verify shelved files 
-	VERIFY_OUTPUT=$(p4 verify -q -S //... 2>&1)
-	RESULT=$?
-	check_returncode_with_msg ${RESULT} "Verifying shelved files failed with errormessage:\n${VERIFY_OUTPUT}"
-
-	echo "Weekly backup succeeded"
+	weekly_backup
 fi
