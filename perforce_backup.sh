@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,u: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token: -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -17,6 +17,10 @@ NO_REVOKE=0
 
 NIGHTLY=0
 WEEKLY=0
+SETUP=0
+
+MAIL_SENDER=-1
+MAIL_TOKEN=-1
 
 GCLOUD_SETUP=0
 
@@ -33,10 +37,21 @@ while true; do
 		--gcloud_setup) GCLOUD_SETUP=1; shift ;;
 		-v|--verbose) VERBOSE=1; shift ;;
 		--no_revoke) NO_REVOKE=1; shift ;;
+		-s|--setup) SETUP=1; shift ;;
 	-m|--mail)
 		case $2 in
 			"") echo "No mail provided, discarding parameter"; shift 2 ;;
 			*) NOTIFICATION_RECIPIENTS="$2"; shift 2 ;;
+		esac ;;
+	--mail_sender)
+		case $2 in
+			"") echo "No mail provided, discarding parameter"; shift 2 ;;
+			*) MAIL_SENDER="$2"; shift 2 ;;
+		esac ;;
+	--mail_token)
+		case $2 in
+			"") echo "No mail token provided, discarding parameter"; shift 2 ;;
+			*) MAIL_TOKEN="$2"; shift 2 ;;
 		esac ;;
 	-u|--p4_user)
 		case $2 in
@@ -79,8 +94,8 @@ while true; do
     esac
 done
 
-if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 ]]; then
-	echoerr "Either nightly, weekly or setup needs to be set for the backupscript to run"
+if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 && "$SETUP" -eq 0 ]]; then
+	echoerr "Either nightly, weekly, setup or weekly_setup needs to be set for the backupscript to run"
 	echoerr "EXITING!"
 	exit -1
 fi
@@ -479,6 +494,52 @@ function weekly_verification() {
 
 	verbose_log "Weekly verification succeeded"
 }
+
+function setup() {
+	require_param "MAIL_SENDER" "--mail_sender"
+	require_param "MAIL_TOKEN" "--mail_token"
+
+	# Require root, as we will install packages with apt
+	if is_root -eq "0" ; then
+		force_exit_msg "Require root to run setup"
+	fi
+
+	# Required for us to download signing keys for google cloud
+	apt-get install apt-transport-https ca-certificates gnupg curl -y
+
+	# If run again, delete old cloud key so we can get the new one
+	if [[ -f "/usr/share/keyrings/cloud.google.gpg" ]]; then
+		rm -f /usr/share/keyrings/cloud.google.gpg
+	fi
+	curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+	# If run again, delete old repository path
+	if [[ -f "/etc/apt/sources.list.d/google-cloud-sdk.list" ]]; then
+		rm -f /etc/apt/sources.list.d/google-cloud-sdk.list
+	fi
+	# Add google cloud repo
+	echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+	# Install google cloud
+	apt-get update && apt-get install google-cloud-cli jq
+
+	# Install ssmtp for sending mail through gmail
+	apt install ssmtp -y
+	echo "mailhub=smtp.gmail.com:587
+	useSTARTTLS=YES
+	AuthUser=$MAIL_SENDER
+	AuthPass=$MAIL_TOKEN
+	TLS_CA_File=/etc/pki/tls/certs/ca-bundle.crt
+	FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
+
+	# Ensure the correct permissions for ssmtp files
+	chown root:mail /etc/ssmtp/ssmtp.conf
+	chmod 640 /etc/ssmtp/ssmtp.conf
+
+	
+}
+
+if [[ "$SETUP" -eq 1 ]]; then
+	setup
+fi
 
 if [[ "$GCLOUD_SETUP" -eq 1 ]]; then
 	gcloud_setup
