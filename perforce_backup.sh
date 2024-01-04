@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -15,6 +15,7 @@ _SERVER_NAME=-1
 
 _P4_ROOT=-1
 _P4_JOURNAL=-1
+_P4_CASE="-C0"
 
 _VERBOSE=0
 _NO_REVOKE=0
@@ -43,6 +44,7 @@ while true; do
 		-v|--verbose) _VERBOSE=1; shift ;;
 		--no_revoke) _NO_REVOKE=1; shift ;;
 		-s|--setup) _SETUP=1; shift ;;
+		--p4_windows_case) _P4_CASE="-C1"; shift ;;
 		-r|--restore)
 			case $2 in
 				"") force_exit_msg "No restore mode provided, please provide 'db' or 'db_and_files', EXITING"; shift 2 ;;
@@ -54,6 +56,7 @@ while true; do
 				"") echo "No P4ROOT provided, discarding parameter"; shift 2 ;;
 				*) _P4_ROOT="$2"; shift 2 ;;
 			esac ;;
+
 		--p4_journal)
 			case $2 in
 				"") echo "No P4JOURNAL provided, discarding parameter"; shift 2 ;;
@@ -682,24 +685,33 @@ function fetch_license_and_server_id() {
 }
 
 function fetch_checkpoint_and_md5() {
+	local CHECKPOINT_FILE_VAR="$1"
+
 	# Declare local variable that doesn't change the $?
 	declare -I GCLOUD_RESULT
 	local BASE_PATH=$(get_gs_bucket_base_path)
 	GCLOUD_RESULT=$(safe_gcloud "storage ls $BASE_PATH/journals/" true)
 	
-	LATEST_CHECKPOINT=$(echo -e "$GCLOUD_RESULT" | grep -E "^.*\.ckp\.(\d*).*\.gz$" | sort -t . -k 3n | tail -1)
-	LATEST_MD5=$(echo -e "${LATEST_CHECKPOINT%gz}md5")
+	local LATEST_CHECKPOINT=$(echo -e "$GCLOUD_RESULT" | grep -E "^.*\.ckp\.(\d*).*\.gz$" | sort -t . -k 3n | tail -1)
+	local LATEST_MD5=$(echo -e "${LATEST_CHECKPOINT%gz}md5")
 
 	local P4ROOT="$(get_p4_root)"
 	local P4JOURNAL_DIR="$P4ROOT/$(get_p4_journal_dir)"
 	GCLOUD_RESULT=$(safe_gcloud "storage cp $LATEST_CHECKPOINT $LATEST_MD5 $P4JOURNAL_DIR" true)
 	
-	CHECKPOINT_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.gz$")
-	MD5_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.md5$")
+	local CHECKPOINT_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.gz$")
+	local MD5_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.md5$")
 
 	safe_command "gzip -df $CHECKPOINT_FILE"
 	
 	verify_checkpoint "${CHECKPOINT_FILE%.gz}"
+
+	# Set the variables passed into the function of the parent scope
+	eval "$CHECKPOINT_FILE_VAR=`realpath ${CHECKPOINT_FILE%.gz}`"
+}
+
+function fetch_versioned_files() {
+	# IS HERE
 }
 
 function restore_db_and_files() {
@@ -716,12 +728,14 @@ function restore_db_and_files() {
 	# 1.2. Rename (or move) the corrupt database (db.*) files
 	temporary_backup_bad_db
 	# 1.3.1 Restore checkpoint and md5
-	fetch_checkpoint_and_md5
+	local CHECKPOINT_FILE_REF
+	fetch_checkpoint_and_md5 CHECKPOINT_FILE_REF
 	# 1.3.2 Get the license and server id
 	fetch_license_and_server_id
 	# 1.4. Invoke p4d with the -jr (journal-restore) flag, specifying only your most recent checkpoint
-	# IS HERE! Need to commit as lots has happened
+	safe_command "p4d $_P4_CASE -r $(get_p4_root) -jr $CHECKPOINT_FILE_REF" true
 	# 2. Recover versioned files
+	fetch_versioned_files
 	# 3. Check your system
 
 	# Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
