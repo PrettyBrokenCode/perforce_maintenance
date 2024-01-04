@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal: -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -12,6 +12,9 @@ NOTIFICATION_RECIPIENTS=-1
 MAINTINANCE_USER=SuperUser
 TICKET=-1
 SERVER_NAME=-1
+
+P4_ROOT=-1
+_P4_JOURNAL=-1
 
 VERBOSE=0
 NO_REVOKE=0
@@ -45,6 +48,16 @@ while true; do
 				"") force_exit_msg "No restore mode provided, please provide 'db' or 'db_and_files', EXITING"; shift 2 ;;
 				db|db_and_files) RESTORE="$2"; shift 2 ;;
 				*) force_exit_msg "Unknown restoration mode '$2', please provide 'db' or 'db_and_files', EXITING"; shift 2 ;;
+			esac ;;
+		--p4_root)
+			case $2 in
+				"") echo "No P4ROOT provided, discarding parameter"; shift 2 ;;
+				*) P4_ROOT="$2"; shift 2 ;;
+			esac ;;
+		--p4_journal)
+			case $2 in
+				"") echo "No P4JOURNAL provided, discarding parameter"; shift 2 ;;
+				*) _P4_JOURNAL="$2"; shift 2 ;;
 			esac ;;
 		-m|--mail)
 			case $2 in
@@ -113,9 +126,11 @@ if [[ "$NIGHTLY" -eq 0 && "$WEEKLY" -eq 0 && "$GCLOUD_SETUP" -eq 0 && "$SETUP" -
 fi
 
 # @TODO: Move all variables that's export into the call of perforce instead of using environment variables and make helper function p4 and safe_p4
+# @TODO: Make ETH_ADAPTER configurable
 ETH_ADAPTER=eth0
 export P4PASSWD="$TICKET"
-IP_ADDR=`ip a s ${ETH_ADAPTER} | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
+IP_ADDR=`ip a s $ETH_ADAPTER | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
+# @TODO: Make port a config variable
 export P4PORT=$IP_ADDR:1666
 export P4USER=$MAINTINANCE_USER
 
@@ -139,8 +154,8 @@ function verbose_log() {
 function force_exit_msg() {
 	local MESSAGE="$1"
 
-	sendmail "${MESSAGE}"
-	echoerr "${MESSAGE}"
+	sendmail "$MESSAGE"
+	echoerr "$MESSAGE"
 
 	force_exit
 }
@@ -148,7 +163,7 @@ function force_exit_msg() {
 function is_root() {
 	local OUTPUT=`whoami`
 
-	if [[ "${OUTPUT}" == "root" ]]; then
+	if [[ "$OUTPUT" == "root" ]]; then
 		return 1
 	fi
 
@@ -160,7 +175,7 @@ function sendmail() {
 
 	# Verify that we have specified the notification recipient
 	if [[ "$NOTIFICATION_RECIPIENTS" != -1 ]]; then
-		echo -e "From: Perforce Server\nSubject: Perforce server backup failed\n\n${MESSAGE}" | ssmtp ${NOTIFICATION_RECIPIENTS}
+		echo -e "From: Perforce Server\nSubject: Perforce server backup failed\n\n$MESSAGE" | ssmtp $NOTIFICATION_RECIPIENTS
 	else
 		verbose_log "No notification recipient specified, no mail sent"
 	fi
@@ -168,27 +183,24 @@ function sendmail() {
 
 function safe_command() {
 	local COMMAND="$1"
-	local PRINT_RESULT=false
-	if [[ "$#" == 2 ]]; then
-		PRINT_RESULT=$2
-	fi
+	shift
+	local PRINT_RESULT=${1:-false}
 
+	# Declare local variable that doesn't change the $?
 	declare -I COMMAND_OUTPUT
 	COMMAND_OUTPUT=$(eval "$COMMAND 2>&1")
-	check_returncode_with_msg $? "Failed to run: '${COMMAND}' with error:\n${COMMAND_OUTPUT}"
-	if [[ "$PRINT_RESULT" = true ]]; then
-		echo -e "${COMMAND_OUTPUT}"
+	check_returncode_with_msg $? "Failed to run: '$COMMAND' with error:\n$COMMAND_OUTPUT"
+	if [[ $PRINT_RESULT = true ]]; then
+		echo -e "$COMMAND_OUTPUT"
 	fi
 }
 
 function safe_gcloud() {
 	local COMMAND="$1"
-	local PRINT_RESULT=false
-	if [[ "$#" == 2 ]]; then
-		PRINT_RESULT="$2"
-	fi
+	shift
+	local PRINT_RESULT=${1:-false}
 
-	safe_command "gcloud $COMMAND -q" "${PRINT_RESULT}"
+	safe_command "gcloud $COMMAND -q" "$PRINT_RESULT"
 }
 
 # checks if a element is present in a array. Ensure that both parameters passed in is enclosed
@@ -207,62 +219,115 @@ function contains_element() {
 # @param 1 The variable we want to pass to p4 configure show
 # @param 2 if false, we are not operating in strict mode, and will not terminate the
 #       application if the config variable doesn't exist
+# @param 3 if false, then we don't print the output of p4 configure show. Only valid if strict is false
 function get_p4config_value() {
 	local CONFIG_VAR="$1"
-	local STRICT=true
-	if [[ $# == 2 ]]; then
-		STRICT=$2
-	fi
-
+	shift
+	local STRICT=${1:-true}
+	shift
+	local PRINT_RESULT=${1:-true}
+	
 	# Get config value
-	local CONFIG_OUTPUT=`p4 configure show ${CONFIG_VAR} 2>&1`
+	local CONFIG_OUTPUT=`p4 configure show $CONFIG_VAR 2>&1`
 	# if the above command output contains "No configurables have been set for server", then
 	# we it's a error. Can't use return value as it's always 0
 
 	local ERROR_STRINGS=("Your session has expired, please login again."
 		"Perforce password (P4PASSWD) invalid or unset.")
 
-	contains_element "${CONFIG_OUTPUT}" "${ERROR_STRINGS[@]}"
-	if [[ $? == 0 || "$CONFIG_OUTPUT" == *"No configurables have been set for server"* ]]; then
-		local ERROR_MSG="Failed to get p4 configure variable ${CONFIG_VAR} with error: '${CONFIG_OUTPUT}'"
-        if [[ $STRICT ]]; then
-			force_exit_msg "${ERROR_MSG}"
+	local PARTIAL_ERROR_STRINGS=("No configurables have been set for server",
+		'Perforce client error: Connect to server failed;')
+
+
+	# 'Perforce client error: Connect to server failed; check $P4PORT. TCP connect to 10.10.10.211:1666 failed. connect: 10.10.10.211:1666: Connection refused'
+	local HAS_ERROR_OUTPUT=false
+
+	case $CONFIG_OUTPUT in
+		"Your session has expired, please login again.")
+			;& # fallthrough
+		"Perforce password (P4PASSWD) invalid or unset.")
+			;& # fallthrough
+		*"No configurables have been set for server"*)
+			;& # fallthrough
+		*$'Perforce client error:\n\tConnect to server failed'*)
+			HAS_ERROR_OUTPUT=true
+			;;
+	esac
+
+	if [[ $HAS_ERROR_OUTPUT == true ]]; then
+		local ERROR_MSG="Failed to get p4 configure variable $CONFIG_VAR with error: '$CONFIG_OUTPUT'"
+        if $STRICT; then
+			force_exit_msg "$ERROR_MSG"
 		else
-			echoerr "${ERROR_MSG}"
+			if $PRINT_RESULT; then
+				echoerr "$ERROR_MSG"
+			fi
 		fi
-		return -1
+		return 1
 	fi
 
 	# p4 configure show return multiple lines, with the hierarchy of how the variable was set, with the first
 	# output having the highest prioerty, so just get the first line and strip away everything before = sign
-	local OUTPUT_WITH_SOURCE=`cut -d "=" -f2- <<< ${CONFIG_OUTPUT} | head -n 1`
+	local OUTPUT_WITH_SOURCE=`cut -d "=" -f2- <<< $CONFIG_OUTPUT | head -n 1`
 	# now the variable might end with " (default)", " (configure)", " (-p)", (-v) or (serverid) to show
 	# where it comes from, strip that
 	echo ${OUTPUT_WITH_SOURCE%% (*)}
 	return 0
 }
 
+
+function get_p4_root() {
+	# Declare local variable that doesn't change the $?
+	declare -I P4ROOT
+	P4ROOT=$(get_p4config_value P4ROOT false false)
+	if [[ $? != 0 ]]; then	
+		require_param "P4_ROOT" "--p4_root"
+		P4ROOT=$P4_ROOT
+	fi
+	echo $P4ROOT
+}
+
+
 function check_returncode_with_msg() {
 	local RETURN_CODE=$1
 	local ERROR_MESSAGE="$2"
 
-	if [[ "${RETURN_CODE}" -ne 0 ]]; then
-		force_exit_msg "${ERROR_MESSAGE}"
+	if [[ "$RETURN_CODE" -ne 0 ]]; then
+		force_exit_msg "$ERROR_MESSAGE"
 	fi
+}
+
+function get_p4_journal_dir() {
+	declare -I JOURNAL_FILE
+	JOURNAL_FILE=$(get_p4config_value P4JOURNAL false false)
+	if [[ $? -ne 0 ]]; then
+		require_param "_P4_JOURNAL" "--p4_journal"
+		JOURNAL_FILE=$_P4_JOURNAL
+	fi
+
+	echo -e "${JOURNAL_FILE%/*}"
 }
 
 function get_backup_account_mail() {
 	require_param "GCLOUD_BACKUP_USER" "--gcloud_backup_user"
 	require_param "GCLOUD_PROJECT" "--gcloud_project"
 
-	echo "${GCLOUD_BACKUP_USER}@${GCLOUD_PROJECT}.iam.gserviceaccount.com"
+	echo "$GCLOUD_BACKUP_USER@$GCLOUD_PROJECT.iam.gserviceaccount.com"
+}
+
+function get_gs_bucket_base_path() {
+	require_param "GCLOUD_BUCKET" "--gcloud_bucket"
+
+	local SERVER_NAME=$(get_server_name)
+
+	echo -e "gs://$GCLOUD_BUCKET/$SERVER_NAME"
 }
 
 function get_backup_role_absolute_path() {
 	require_param "GCLOUD_PROJECT" "--gcloud_project"
 	require_param "GCLOUD_BACKUP_ROLE" "--gcloud_backup_role"
 
-	echo "projects/${GCLOUD_PROJECT}/roles/${GCLOUD_BACKUP_ROLE}"
+	echo "projects/$GCLOUD_PROJECT/roles/$GCLOUD_BACKUP_ROLE"
 }
 
 function backup_account_cred_file() {
@@ -294,11 +359,32 @@ function callstack() {
 function show_var() {
 	local VARNAME=$1
 
-	echo -e "${VARNAME}='${!VARNAME}'"
+	echo -e "$VARNAME='${!VARNAME}'"
 }
 
 function from_func() {
 	cut -d ' ' -f 2 <<< `caller 1`
+}
+
+function parse_md5_file_content() {
+	local MD5_FILE_CONTENT="$1"
+
+	echo -e $(sed -nE 's/^MD5 \(.+\) = (.+)$/\1/p' <<< $MD5_FILE_CONTENT)
+
+}
+
+function get_server_name() {
+	local P4ROOT=$(get_p4_root)
+
+	# If no --server_name was provided, then we set one
+	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
+		# For some reason, p4 configure show serverid doesn't work, even thou it shows up when running p4 configure show
+		SERVER_NAME=$(safe_command "cat $P4ROOT/server.id" true)
+	fi
+	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
+		force_exit_msg "No server name is set, please pass in --server_name to ensure that you know where your backup is stored"
+	fi
+	echo $SERVER_NAME
 }
 
 function require_param() {
@@ -306,10 +392,34 @@ function require_param() {
 	local PARAMETER_NAME="$2"
 
 	if [[ "${!VARNAME}" == "-1" || "${!VARNAME}" == "" ]]; then
-		force_exit_msg "$(from_func) failed: reqires ${PARAMETER_NAME} to be passed"
+		force_exit_msg "$(from_func) failed: reqires $PARAMETER_NAME to be passed"
 	fi
 }
 
+function stop_p4d() {
+	if [[ $(ps auxc | grep p4d) ]]; then
+		safe_command "p4 admin stop"
+	else
+		verbose_log "No p4d process running, no need to stop perforce"
+	fi
+}
+
+function temporary_backup_bad_db() {
+	local P4ROOT=$(get_p4_root)
+
+	verbose_log "Making backup of db-files to /tmp/perforce_restore/"
+	mkdir /tmp/perforce_restore 2> /dev/null
+	if [[ $(ls /mnt/PerforceLive/root | grep db. | wc -l) -gt 0 ]]; then
+		safe_command "mv $P4ROOT/db.* /tmp/perforce_restore/" true
+	else
+		verbose_log "No db.* files to backup..."
+	fi
+}
+
+function remove_bad_db_backup() {
+	verbose_log "Removing /tmp/perforce_restore after restoring db"
+	safe_command "rm -rf /tmp/perforce_restore"
+}
 
 function gcloud_setup() {
 	verbose_log "Running SETUP"
@@ -320,35 +430,36 @@ function gcloud_setup() {
 	require_param "GCLOUD_BACKUP_USER" 	"--gcloud_backup_user"
 	require_param "GCLOUD_BACKUP_ROLE" 	"--gcloud_backup_role"
 
+	# Declare local variable that doesn't change the $?
 	declare -I GCLOUD_OUTPUT
 
 	# Check if the user is already logged in
-	GCLOUD_OUTPUT=$(safe_gcloud "auth list --filter-account=${GCLOUD_USER} --format=json" true)
+	GCLOUD_OUTPUT=$(safe_gcloud "auth list --filter-account=$GCLOUD_USER --format=json" true)
 
 	# Need to login, so run interactive prompt (don't use safe_gcloud or safe_command)
-	if  [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq "0" ]]; then
-		gcloud auth login ${GCLOUD_USER}
+	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq "0" ]]; then
+		gcloud auth login $GCLOUD_USER
 		check_returncode_with_msg "$?" "gcloud_setup failed: Failed to login"
 	else
-		verbose_log "Setting account ${GCLOUD_USER}"
+		verbose_log "Setting account $GCLOUD_USER"
 		# Set the active account
-		safe_gcloud "config set account ${GCLOUD_USER}" true
+		safe_gcloud "config set account $GCLOUD_USER" true
 	fi
 
 	# Ensure that we are working on the correct project
-	GCLOUD_OUTPUT=$(safe_gcloud "config set project ${GCLOUD_PROJECT}" true)
+	GCLOUD_OUTPUT=$(safe_gcloud "config set project $GCLOUD_PROJECT" true)
 
-	if [[ "${GCLOUD_OUTPUT}" == *"WARNING: You do not appear to have access to project [${GCLOUD_PROJECT}] or it does not exist."* ]]; then
-		force_exit_msg "gcloud_setup failed: You don't have permission or the project ${GCLOUD_PROJECT} doesn't exist: Error: \n'${GCLOUD_OUTPUT}'"
+	if [[ "$GCLOUD_OUTPUT" == *"WARNING: You do not appear to have access to project [$GCLOUD_PROJECT] or it does not exist."* ]]; then
+		force_exit_msg "gcloud_setup failed: You don't have permission or the project $GCLOUD_PROJECT doesn't exist: Error: \n'$GCLOUD_OUTPUT'"
 	fi
 
 	# check if the bucket exists
-	GCLOUD_OUTPUT=$(safe_gcloud "storage buckets list --filter=${GCLOUD_BUCKET} --format=json" true)
+	GCLOUD_OUTPUT=$(safe_gcloud "storage buckets list --filter=$GCLOUD_BUCKET --format=json" true)
 
 	# Bucket doesn't exist, create it
-	if  [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
+	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
 		verbose_log "Creating bucket"
-		safe_gcloud "storage buckets create gs://${GCLOUD_BUCKET}/ \
+		safe_gcloud "storage buckets create gs://$GCLOUD_BUCKET/ \
 		--uniform-bucket-level-access \
 		--default-storage-class=Standard \
 		--location=EUROPE-NORTH1 \
@@ -362,7 +473,7 @@ function gcloud_setup() {
 	local REQUIRED_PERMISSIONS="storage.objects.list,storage.objects.create,storage.objects.delete,storage.objects.get"
 
 	# Check if the role exists
-	gcloud iam roles describe ${GCLOUD_BACKUP_ROLE} --project=${GCLOUD_PROJECT} > /dev/null
+	gcloud iam roles describe $GCLOUD_BACKUP_ROLE --project=$GCLOUD_PROJECT > /dev/null
 	
 	# If the backup role doesn't exist, create it
 	if [[ "$?" -eq "1" ]]; then
@@ -376,23 +487,23 @@ function gcloud_setup() {
 
 	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(get_backup_account_mail) 2>&1`
 
-	if [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
+	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
 		# User doesn't exist, create it
-		safe_gcloud "iam service-accounts create ${GCLOUD_BACKUP_USER} --display-name=\"Perforce backup user\"" true
+		safe_gcloud "iam service-accounts create $GCLOUD_BACKUP_USER --display-name=\"Perforce backup user\"" true
 	else
 		verbose_log	"Skipping creating service account as it already exists"
 	fi
 
 	# Get the roles of the service account to verify that the service account has the correct role
-	GCLOUD_OUTPUT=$(safe_gcloud "projects get-iam-policy ${GCLOUD_PROJECT} --flatten='bindings[].members' \
+	GCLOUD_OUTPUT=$(safe_gcloud "projects get-iam-policy $GCLOUD_PROJECT --flatten='bindings[].members' \
 		--format='table(bindings.role)' \
 		--filter='bindings.members:serviceAccount:$(get_backup_account_mail) AND \
 			bindings.role=$(get_backup_role_absolute_path)' --format=json" true)
 
-	if [[ $(echo -e "${GCLOUD_OUTPUT}" | jq length) -eq 0 ]]; then
+	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
 		# Add the role to the service account
 		verbose_log "Adding the role $(get_backup_role_absolute_path) to backup user $(get_backup_account_mail)"
-		safe_gcloud "projects add-iam-policy-binding ${GCLOUD_PROJECT} \
+		safe_gcloud "projects add-iam-policy-binding $GCLOUD_PROJECT \
 			--role=$(get_backup_role_absolute_path) \
 			--member=serviceAccount:$(get_backup_account_mail)" true
 	else
@@ -415,7 +526,7 @@ function gcloud_setup() {
 
 	if [[ "$NO_REVOKE" -ne "0" ]]; then
 		# Revoke our credentials so that they don't stay on the server by accident
-		safe_gcloud "auth revoke ${GCLOUD_USER}"
+		safe_gcloud "auth revoke $GCLOUD_USER"
 	fi
 
 	force_exit
@@ -423,8 +534,6 @@ function gcloud_setup() {
 
 function nightly_backup() {
 	# Reference: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-procedure.html
-	# Nightly backup
-
 	require_param "GCLOUD_PROJECT" "--gcloud_project"
 	require_param "GCLOUD_BUCKET" "--gcloud_bucket"
 	require_param "GCLOUD_BACKUP_USER" "--gcloud_backup_user"
@@ -432,53 +541,37 @@ function nightly_backup() {
 
 
 	local P4ROOT=$(get_p4config_value P4ROOT)
+	# @TODO: Change this so that P4ROOT is passed into the command instead
 	eval "export P4ROOT=$P4ROOT"
 
-	local JOURNAL_FILE=$(get_p4config_value P4JOURNAL)
-	local JOURNAL_PREFIX=$(get_p4config_value journalPrefix)
-	local JOURNAL_DIR="${JOURNAL_FILE%/*}"
+	local JOURNAL_DIR=$(get_p4_journal_dir)
 
 	local ARCHIVES_DIR=$(get_p4config_value server.depot.root)
-
-	# If no --server_name was provided, then we set one
-	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
-		# For some reason, p4 configure show serverid doesn't work, even thou it shows up when running p4 configure show
-		SERVER_NAME=$(safe_command "cat $P4ROOT/server.id" true)
-	fi
-	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
-		force_exit_msg "No server name is set, please pass in --server_name to ensure that you know where your backup is stored"
-	fi
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
 	local CHECKPOINT_OUTPUT=$(safe_command "p4d -jc -z" true)
 
 	# 2. Ensure the checkpointing was successful
-	local PARSE_MD5_SED_CMD='s/^MD5 \(.+\) = (.+)$/\1/p'
-
-	local JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< ${CHECKPOINT_OUTPUT}`
-	local CHECKPOINT_REPORTED_MD5=`sed -nE "${PARSE_MD5_SED_CMD}" <<< ${CHECKPOINT_OUTPUT}`
+	local JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< $CHECKPOINT_OUTPUT`
+	local CHECKPOINT_REPORTED_MD5=$(parse_md5_file_content "$CHECKPOINT_OUTPUT")
 	
 	verbose_log "Validating journal file was correctly written to disk..."
 	# Validate journal file
-	safe_command "p4d -jv \"${P4ROOT}/${JOURNAL_BACKUP_FILE}\"" false
+	safe_command "p4d -jv \"$P4ROOT/$JOURNAL_BACKUP_FILE\"" false
 	# 3. Confirm checkpoint was correctly written to disk with md5
-	gzip -dk "${P4ROOT}/${JOURNAL_BACKUP_FILE}"
+	gzip -dk "$P4ROOT/$JOURNAL_BACKUP_FILE"
 
-	local JOURNAL_BACKUP_FILE_WITHOUT_GZ=${P4ROOT}/${JOURNAL_BACKUP_FILE%.gz}
-	local MD5_FILE_CONTENT=`cat "${JOURNAL_BACKUP_FILE_WITHOUT_GZ}.md5" | sed -nE "${PARSE_MD5_SED_CMD}"`
+	local JOURNAL_BACKUP_FILE_WITHOUT_GZ=$P4ROOT/${JOURNAL_BACKUP_FILE%.gz}
+	local MD5_FILE_CONTENT=$(parse_md5_file_content "`cat $JOURNAL_BACKUP_FILE_WITHOUT_GZ.md5`")
 	if [[ "${MD5_FILE_CONTENT^^}" != "${CHECKPOINT_REPORTED_MD5^^}" ]]; then
 		force_exit_msg "MD5 file has become corrupted during write! Aborting backup"
 	fi
 
-	local MD5_OF_CHECKPOINT=`md5sum ${JOURNAL_BACKUP_FILE_WITHOUT_GZ} | awk '{print $1}'`
-
-	if [[ "${MD5_OF_CHECKPOINT^^}" != "${MD5_FILE_CONTENT^^}" ]]; then
-		force_exit_msg "Checkpoint file has become corrupted during write! Aborting backup"
-	fi
+	verify_checkpoint "$JOURNAL_BACKUP_FILE_WITHOUT_GZ"
 
 	# Remove the extracted file that we used to verify the md5 of
-	rm -f "${JOURNAL_BACKUP_FILE_WITHOUT_GZ}"
+	rm -f "$JOURNAL_BACKUP_FILE_WITHOUT_GZ"
 
 	# 4. Trim down amount of checkpoints stored locally on the server
 	# @TODO: IMPLEMENT
@@ -488,21 +581,23 @@ function nightly_backup() {
 	# Set correct project in google cloud
 	verbose_log "Authenticating with google cloud storage..."
 	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(backup_account_cred_file)" true
-	safe_gcloud "config set project ${GCLOUD_PROJECT}"
+	safe_gcloud "config set project $GCLOUD_PROJECT"
+
+	local GS_BASE_PATH=$(get_gs_bucket_base_path)
 
 	verbose_log "Sending journals and checkpoints to google cloud..."
 	# 	checkpoint + md5, rotated journal file
-	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${JOURNAL_DIR}" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/journals" true
+	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$JOURNAL_DIR" $GS_BASE_PATH/journals" true
 	#	license file
 	verbose_log "Sending license to google cloud..."
-	safe_gcloud "storage cp "${P4ROOT}/license" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/license" true
+	safe_gcloud "storage cp "$P4ROOT/license" $GS_BASE_PATH/license" true
 	#	versioned files
 	verbose_log "Sending content to google cloud..."
-	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "${P4ROOT}/${ARCHIVES_DIR}" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/archives" true
+	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$ARCHIVES_DIR" $GS_BASE_PATH/archives" true
 
 	# 6. backup the server.id
 	verbose_log "Sending server.id to google cloud..."
-	safe_gcloud "storage cp "${P4ROOT}/server.id" gs://${GCLOUD_BUCKET}/${SERVER_NAME}/server.id" true
+	safe_gcloud "storage cp "$P4ROOT/server.id" $GS_BASE_PATH/server.id" true
 
 	verbose_log "Nightly backup succeeded"
 }
@@ -518,18 +613,118 @@ function weekly_verification() {
 	verbose_log "Weekly verification succeeded"
 }
 
+# To delete the DB-files to test it, use the following command
+# sudo find <P4ROOT> -type f -name db.* -exec rm {} \;
 function restore_db() {
-	# How to restore is specified here: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.database_corruption.html
 	force_exit_msg "restore_db not implemented yet"
+	# This doesn't need to be implemented right now, as current usecase doesn't store the db on a different harddrive than the files
+	## How to restore is specified here: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.database_corruption.html
+	## 1. Requires "Last checkpoint file"
+	## 1a, Get it from disk
+	## 1b, Get it from gcm
+	## 2. md5 of last checkpoint
+	## 3. Current journal file
+#
+	## Steps:
+	## 1. Stop the p4d server
+	#stop_p4d
+	## 2. Rename (or move) the database (db.*) files on your system
+	#temporary_backup_bad_db
+	# SHOULD BE HERE SOMEWHERE IN THE IMPLEMENTATION
+#
+#
+	## 3. Verify the integrity of your checkpoint using a command like the following:
+	## 4. Restore most recent journal file
+#
+	## Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
+	#remove_bad_db_backup
+}
 
-	# Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
+function gs_file_exists() {
+	local GS_FILE="$1"
+
+	gsutil stat $GS_FILE > /dev/null 2>&1
+	return $?
+}
+
+function verify_checkpoint() {
+	local CHECKPOINT_FILE=$(realpath "$1")
+
+	local PARSE_MD5_SED_CMD='s/^MD5 \(.+\) = (.+)$/\1/p'
+
+	local MD5_FILE_CONTENT=$(parse_md5_file_content "`cat $CHECKPOINT_FILE.md5`")
+	local MD5_OF_CHECKPOINT=`md5sum $CHECKPOINT_FILE | awk '{print $1}'`
+
+	if [[ "${MD5_OF_CHECKPOINT^^}" != "${MD5_FILE_CONTENT^^}" ]]; then
+		force_exit_msg "md5 of $CHECKPOINT_FILE mismatches with content of $CHECKPOINT_FILE.md5. Aborting!"
+	fi
+}
+
+function fetch_license_and_server_id() {
+	local FILES_TO_FETCH=""
+	gs_file_exists "$(get_gs_bucket_base_path)/server.id"
+	if [[ $? -eq 0 ]]; then
+		FILES_TO_FETCH="$(get_gs_bucket_base_path)/server.id"
+	fi
+	gs_file_exists "$(get_gs_bucket_base_path)/license"
+	if [[ $? -eq 0 ]]; then
+		FILES_TO_FETCH="$FILES_TO_FETCH $(get_gs_bucket_base_path)/license"
+	fi
+
+	# Do we have any files to fetch, then we fetch them
+	if [[ "${#FILES_TO_FETCH}" -gt 0 ]]; then
+		safe_gcloud "storage cp $FILES_TO_FETCH $(get_p4_root)" 
+	else
+		verbose_log "Neither license nor server.id to fetch"
+	fi
+}
+
+function fetch_checkpoint_and_md5() {
+	# Declare local variable that doesn't change the $?
+	declare -I GCLOUD_RESULT
+	local BASE_PATH=$(get_gs_bucket_base_path)
+	GCLOUD_RESULT=$(safe_gcloud "storage ls $BASE_PATH/journals/" true)
+	
+	LATEST_CHECKPOINT=$(echo -e "$GCLOUD_RESULT" | grep -E "^.*\.ckp\.(\d*).*\.gz$" | sort -t . -k 3n | tail -1)
+	LATEST_MD5=$(echo -e "${LATEST_CHECKPOINT%gz}md5")
+
+	local P4ROOT="$(get_p4_root)"
+	local P4JOURNAL_DIR="$P4ROOT/$(get_p4_journal_dir)"
+	GCLOUD_RESULT=$(safe_gcloud "storage cp $LATEST_CHECKPOINT $LATEST_MD5 $P4JOURNAL_DIR" true)
+	
+	CHECKPOINT_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.gz$")
+	MD5_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.md5$")
+
+	safe_command "gzip -df $CHECKPOINT_FILE"
+	
+	verify_checkpoint "${CHECKPOINT_FILE%.gz}"
 }
 
 function restore_db_and_files() {
 	# How to restore is specified here: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.damage.html
-	force_exit_msg "restore_db_and_files not implemented yet"
+
+	# REQUIRES:
+	# 1. Last checkpoint file and .md5 file
+	# 2. Backed up versioned files
+
+	# Steps:
+	# 1. RECOVER DATABASE
+	# 1.1. Stop the p4d server
+	stop_p4d
+	# 1.2. Rename (or move) the corrupt database (db.*) files
+	temporary_backup_bad_db
+	# 1.3.1 Restore checkpoint and md5
+	fetch_checkpoint_and_md5
+	# 1.3.2 Get the license and server id
+	fetch_license_and_server_id
+	# 1.4. Invoke p4d with the -jr (journal-restore) flag, specifying only your most recent checkpoint
+	# IS HERE! Need to commit as lots has happened
+	# 2. Recover versioned files
+	# 3. Check your system
 
 	# Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
+
+	remove_bad_db_backup
 }
 
 function setup() {
