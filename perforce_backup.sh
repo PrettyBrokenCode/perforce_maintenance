@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir: -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -16,6 +16,7 @@ _SERVER_NAME=-1
 _P4_ROOT=-1
 _P4_JOURNAL=-1
 _P4_CASE="-C0"
+_P4_ARCHIVES_DIR=-1
 
 _VERBOSE=0
 _NO_REVOKE=0
@@ -56,7 +57,11 @@ while true; do
 				"") echo "No P4ROOT provided, discarding parameter"; shift 2 ;;
 				*) _P4_ROOT="$2"; shift 2 ;;
 			esac ;;
-
+		--p4_archive_dir)
+			case $2 in
+				"") echo "No P4 ARCHIVES DIR provided (server.depot.root), discarding parameter"; shift 2 ;;
+				*) _P4_ARCHIVES_DIR="$2"; shift 2 ;;
+			esac ;;
 		--p4_journal)
 			case $2 in
 				"") echo "No P4JOURNAL provided, discarding parameter"; shift 2 ;;
@@ -290,6 +295,16 @@ function get_p4_root() {
 	echo $P4ROOT
 }
 
+function get_p4_archives_dir() {
+	declare -I ARCHIVES_DIR
+	ARCHIVES_DIR=$(get_p4config_value server.depot.root false false)
+	if [[ $? -ne 0 ]]; then
+		require_param "_P4_ARCHIVES_DIR" "--p4_archive_dir"
+		ARCHIVES_DIR="$_P4_ARCHIVES_DIR"
+	fi
+	echo -e "$ARCHIVES_DIR"
+}
+
 
 function check_returncode_with_msg() {
 	local RETURN_CODE=$1
@@ -401,12 +416,21 @@ function require_param() {
 	fi
 }
 
-function stop_p4d() {
-	if [[ $(ps auxc | grep p4d) ]]; then
-		safe_command "p4 admin stop"
-	else
-		verbose_log "No p4d process running, no need to stop perforce"
+function p4_service() {
+	local ACTION="$1"
+	
+	if is_root -eq "0" ; then
+		force_exit_msg "Require root to control p4d"
 	fi
+
+	case "$ACTION" in
+		"start") ;& # Fallthrough
+		"stop") ;& # Fallthrough
+		"restart") ;;
+		*) force_exit_msg "Unknown actions '$ACTION' passed to p4_service" ;;
+	esac
+
+	safe_command "systemctl $ACTION helix-p4dctl"
 }
 
 function temporary_backup_bad_db() {
@@ -551,7 +575,7 @@ function nightly_backup() {
 
 	local JOURNAL_DIR=$(get_p4_journal_dir)
 
-	local ARCHIVES_DIR=$(get_p4config_value server.depot.root)
+	local ARCHIVES_DIR=$(get_p4_archives_dir)
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
@@ -711,11 +735,22 @@ function fetch_checkpoint_and_md5() {
 }
 
 function fetch_versioned_files() {
-	# IS HERE
+	local GS_BASE_PATH=$(get_gs_bucket_base_path)
+	local P4ROOT=$(get_p4_root)
+	local ARCHIVES_DIR=$(get_p4_archives_dir)
+
+	safe_gcloud "storage rsync -r $GS_BASE_PATH/archives $P4ROOT/$ARCHIVES_DIR" true
+	# Permissions might have changed after downloading the files
+	safe_command "chmod 700 -R $P4ROOT/$ARCHIVES_DIR"
 }
 
 function restore_db_and_files() {
 	# How to restore is specified here: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.damage.html
+
+	# Require root, as we will install packages with apt
+	if is_root -eq "0" ; then
+		force_exit_msg "Require root to run restore_db_and_files"
+	fi
 
 	# REQUIRES:
 	# 1. Last checkpoint file and .md5 file
@@ -724,7 +759,7 @@ function restore_db_and_files() {
 	# Steps:
 	# 1. RECOVER DATABASE
 	# 1.1. Stop the p4d server
-	stop_p4d
+	p4_service "stop"
 	# 1.2. Rename (or move) the corrupt database (db.*) files
 	temporary_backup_bad_db
 	# 1.3.1 Restore checkpoint and md5
@@ -737,6 +772,10 @@ function restore_db_and_files() {
 	# 2. Recover versioned files
 	fetch_versioned_files
 	# 3. Check your system
+	# Start the system again so we can read p4 counter lastCheckpointAction
+	p4_service "start"
+	LAST_CHECKPOINT_ACTION=$(safe_command "p4 counter lastCheckpointAction")
+	show_var LAST_CHECKPOINT_ACTION
 
 	# Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
 
