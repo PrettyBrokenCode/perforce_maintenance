@@ -3,21 +3,22 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir: -- "$@")
+TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
 
 _NOTIFICATION_RECIPIENTS=-1
-_MAINTINANCE_USER=SuperUser
-_TICKET=-1
 _SERVER_NAME=-1
 
+_P4_USER=SuperUser
+_P4_TICKET=-1
 _P4_ROOT=-1
 _P4_JOURNAL=-1
 _P4_CASE="-C0"
 _P4_ARCHIVES_DIR=-1
 
+_FETCH_LICENSE=true
 _VERBOSE=0
 _NO_REVOKE=0
 
@@ -46,6 +47,7 @@ while true; do
 		--no_revoke) _NO_REVOKE=1; shift ;;
 		-s|--setup) _SETUP=1; shift ;;
 		--p4_windows_case) _P4_CASE="-C1"; shift ;;
+		--no_fetch_license) _FETCH_LICENSE=false; shift ;;
 		-r|--restore)
 			case $2 in
 				"") force_exit_msg "No restore mode provided, please provide 'db' or 'db_and_files', EXITING"; shift 2 ;;
@@ -85,17 +87,17 @@ while true; do
 		-u|--p4_user)
 			case $2 in
 				"") echo "No p4 user provided, discarding parameter"; shift 2 ;;
-				*) _MAINTINANCE_USER="$2"; shift 2 ;;
+				*) _P4_USER="$2"; shift 2 ;;
 			esac ;;
 		--server_name)
 			case $2 in
 				"") echo "No server name provided, discarding parameter"; shift 2 ;;
 				*) _SERVER_NAME="$2"; shift 2 ;;
 			esac ;;
-		-t|--ticket) 
+		-t|--p4_ticket) 
 			case $2 in
-				"") echo "No ticket provided, using default ticket"; shift 2 ;;
-				*) _TICKET="$2"; shift 2 ;;
+				"") echo "No ticket provided, discarding parameter"; shift 2 ;;
+				*) _P4_TICKET="$2"; shift 2 ;;
 			esac ;;
 		--gcloud_user)
 			case $2 in
@@ -134,13 +136,8 @@ if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETU
 fi
 
 # @TODO: Move all variables that's export into the call of perforce instead of using environment variables and make helper function p4 and safe_p4
-# @TODO: Make ETH_ADAPTER configurable
-ETH_ADAPTER=eth0
-export P4PASSWD="$_TICKET"
-IP_ADDR=`ip a s $ETH_ADAPTER | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
-# @TODO: Make port a config variable
-export P4PORT=$IP_ADDR:1666
-export P4USER=$_MAINTINANCE_USER
+export P4PASSWD="$_P4_TICKET"
+export P4USER=$_P4_USER
 
 # Ensure that we can quit in the middle of a function by running exit 1 if we catches the TERM signal
 trap "exit 1" TERM
@@ -190,8 +187,7 @@ function sendmail() {
 }
 
 function safe_command() {
-	local COMMAND="$1"
-	shift
+	local COMMAND="$1"; shift
 	local PRINT_RESULT=${1:-false}
 
 	# Declare local variable that doesn't change the $?
@@ -201,6 +197,14 @@ function safe_command() {
 	if [[ $PRINT_RESULT = true ]]; then
 		echo -e "$COMMAND_OUTPUT"
 	fi
+}
+
+function safe_command_as() {
+	local COMMAND="$1"; shift
+	local USER="$1"; shift
+	local PRINT_RESULT=${1:-false}
+
+	safe_command "sudo -u $USER $COMMAND" "$PRINT_RESULT"
 }
 
 function safe_gcloud() {
@@ -223,16 +227,21 @@ function contains_element() {
 	return 1
 }
 
+function get_p4_port() {
+	local ETH_ADAPTER=eth0
+	local IP_ADDR=`ip a s $ETH_ADAPTER | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
+	# @TODO: Make this configurable
+	echo "$IP_ADDR:1666"
+}
+
 # Helper function to get p4 config values, takes 1-2 parameters
 # @param 1 The variable we want to pass to p4 configure show
 # @param 2 if false, we are not operating in strict mode, and will not terminate the
 #       application if the config variable doesn't exist
 # @param 3 if false, then we don't print the output of p4 configure show. Only valid if strict is false
 function get_p4config_value() {
-	local CONFIG_VAR="$1"
-	shift
-	local STRICT=${1:-true}
-	shift
+	local CONFIG_VAR="$1"; shift
+	local STRICT=${1:-true}; shift
 	local PRINT_RESULT=${1:-true}
 	
 	# Get config value
@@ -251,15 +260,11 @@ function get_p4config_value() {
 	local HAS_ERROR_OUTPUT=false
 
 	case $CONFIG_OUTPUT in
-		"Your session has expired, please login again.")
-			;& # fallthrough
-		"Perforce password (P4PASSWD) invalid or unset.")
-			;& # fallthrough
-		*"No configurables have been set for server"*)
-			;& # fallthrough
+		"Your session has expired, please login again.")			;& # fallthrough
+		"Perforce password (P4PASSWD) invalid or unset.")			;& # fallthrough
+		*"No configurables have been set for server"*)				;& # fallthrough
 		*$'Perforce client error:\n\tConnect to server failed'*)
-			HAS_ERROR_OUTPUT=true
-			;;
+			HAS_ERROR_OUTPUT=true ;;
 	esac
 
 	if [[ $HAS_ERROR_OUTPUT == true ]]; then
@@ -283,6 +288,55 @@ function get_p4config_value() {
 	return 0
 }
 
+function _p4_internal() {
+	require_param "_P4_USER" "--p4_user"
+	
+	local EXECUTABLE="$1"; shift
+	local COMMAND="$1"; shift
+	local SAFE="$1"; shift
+	local PRINT_RESULT="$1"
+
+	local func_name="safe_command_as"
+	if [[ "$SAFE" = false ]]; then
+		func_name="run_as"
+	fi
+	$func_name "$EXECUTABLE -p $(get_p4_port) -u $_P4_USER $COMMAND" "perforce" "$PRINT_RESULT"
+}
+
+function run_p4() {
+	require_param "_P4_TICKET" "--p4_ticket"
+
+	local COMMAND="$1"; shift
+	local SAFE=${1:-true}; shift
+	local PRINT_RESULT=${1:-true}
+
+	_p4_internal "p4" "-P $_P4_TICKET $COMMAND" "$SAFE" "$PRINT_RESULT"
+}
+
+function run_p4d() {
+	local COMMAND="$1"; shift
+	local SAFE=${1:-true}; shift
+	local PRINT_RESULT=${1:-true}
+
+	_p4_internal "p4d" "$COMMAND" "$SAFE" "$PRINT_RESULT"
+}
+
+function run_p4dctl() {
+	local ACTION="$1"
+	
+	if is_root -eq "0" ; then
+		force_exit_msg "Require root to control system service helix-p4dctl"
+	fi
+
+	case "$ACTION" in
+		"start") ;& # Fallthrough
+		"stop") ;& # Fallthrough
+		"restart") ;;
+		*) force_exit_msg "Unknown actions '$ACTION' passed to p4dctl" ;;
+	esac
+	
+	safe_command "systemctl $ACTION helix-p4dctl"
+}
 
 function get_p4_root() {
 	# Declare local variable that doesn't change the $?
@@ -374,6 +428,24 @@ function callstack() {
 	done
 }
 
+# @returns 1 on yes and 0 on no
+function ask_yes_no_question() {
+	local QUESTION="$1"
+	local ANSWER=""
+
+	echo -e "$QUESTION ([y/n])"
+	while [ true ]; do
+		read ANSWER
+		if [[ "${ANSWER,,}" == "y" || "${ANSWER,,}" == "yes" ]]; then
+			return 1
+		elif [[ "${ANSWER,,}" == "n" || "${ANSWER,,}" == "no" ]]; then
+			return 0
+		else
+			echo -e "Please answer with y/n, yes/no\n"
+		fi
+	done
+}
+
 function show_var() {
 	local VARNAME=$1
 
@@ -412,37 +484,33 @@ function require_param() {
 	local PARAMETER_NAME="$2"
 
 	if [[ "${!VARNAME}" == "-1" || "${!VARNAME}" == "" ]]; then
-		force_exit_msg "$(from_func) failed: reqires $PARAMETER_NAME to be passed"
+		force_exit_msg "$(from_func) failed: reqires $PARAMETER_NAME to be passed!\n$(callstack)"
 	fi
 }
 
-function p4_service() {
-	local ACTION="$1"
-	
-	if is_root -eq "0" ; then
-		force_exit_msg "Require root to control p4d"
-	fi
-
-	case "$ACTION" in
-		"start") ;& # Fallthrough
-		"stop") ;& # Fallthrough
-		"restart") ;;
-		*) force_exit_msg "Unknown actions '$ACTION' passed to p4_service" ;;
-	esac
-
-	safe_command "systemctl $ACTION helix-p4dctl"
-}
 
 function temporary_backup_bad_db() {
+	set +x
 	local P4ROOT=$(get_p4_root)
 
-	verbose_log "Making backup of db-files to /tmp/perforce_restore/"
-	mkdir /tmp/perforce_restore 2> /dev/null
+	verbose_log "Making backup of db-files to /tmp/perforce_restore/..."
+	run_as "mkdir /tmp/perforce_restore" "perforce" false
 	if [[ $(ls /mnt/PerforceLive/root | grep db. | wc -l) -gt 0 ]]; then
 		safe_command "mv $P4ROOT/db.* /tmp/perforce_restore/" true
+
+		safe_command "chown -R perforce:perforce /tmp/perforce_restore/"
+		safe_command "chmod -R 755 /tmp/perforce_restore/"
 	else
 		verbose_log "No db.* files to backup..."
 	fi
+}
+
+function set_perforce_permissions() {
+	local FILES="$1"; shift
+	local OPTS="$1"
+
+	safe_command "chown $OPTS perforce:perforce $FILES"
+	safe_command "chmod $OPTS 700 $FILES"
 }
 
 function remove_bad_db_backup() {
@@ -566,7 +634,7 @@ function nightly_backup() {
 	require_param "_GCLOUD_PROJECT" "--gcloud_project"
 	require_param "_GCLOUD_BUCKET" "--gcloud_bucket"
 	require_param "_GCLOUD_BACKUP_USER" "--gcloud_backup_user"
-	require_param "_TICKET" "-t|--ticket"
+	require_param "_P4_TICKET" "-t|--p4_ticket"
 
 
 	local P4ROOT=$(get_p4config_value P4ROOT)
@@ -632,7 +700,7 @@ function nightly_backup() {
 }
 
 function weekly_verification() {
-	require_param "_TICKET" "-t|--ticket"
+	require_param "_P4_TICKET" "-t|--p4_ticket"
 
 	# 1. Verify archive files
 	safe_command "p4 verify -q //..."
@@ -676,6 +744,27 @@ function gs_file_exists() {
 	return $?
 }
 
+function run_as() {
+	local COMMAND="$1"; shift
+	local USER="$1"; shift
+	local PRINT_RESULT=${1:-false}
+
+	local USER_SWITCH_COMMAND=""
+	if [[ "$(whoami)" != "$USER" ]]; then
+		USER_SWITCH_COMMAND="sudo -u $USER"
+	fi
+
+	# Declare local variable that doesn't change the $?
+	declare -I COMMAND_OUTPUT
+	COMMAND_OUTPUT=$(eval "$USER_SWITCH_COMMAND $COMMAND 2>&1")
+	local RESULT=$?
+	if [[ $PRINT_RESULT = true ]]; then
+		echo -e "$COMMAND_OUTPUT"
+	fi
+
+	return "$RESULT"
+}
+
 function verify_checkpoint() {
 	local CHECKPOINT_FILE=$(realpath "$1")
 
@@ -690,25 +779,32 @@ function verify_checkpoint() {
 }
 
 function fetch_license_and_server_id() {
+	verbose_log "Fetching license and server id..."
+	local FETCH_LICENSE=${1:-true}
+
 	local FILES_TO_FETCH=""
-	gs_file_exists "$(get_gs_bucket_base_path)/server.id"
-	if [[ $? -eq 0 ]]; then
+	if gs_file_exists "$(get_gs_bucket_base_path)/server.id" -eq 0; then
 		FILES_TO_FETCH="$(get_gs_bucket_base_path)/server.id"
 	fi
-	gs_file_exists "$(get_gs_bucket_base_path)/license"
-	if [[ $? -eq 0 ]]; then
-		FILES_TO_FETCH="$FILES_TO_FETCH $(get_gs_bucket_base_path)/license"
+
+	if $FETCH_LICENSE; then
+		if gs_file_exists "$(get_gs_bucket_base_path)/license" -eq 0; then
+			FILES_TO_FETCH="$FILES_TO_FETCH $(get_gs_bucket_base_path)/license"
+		fi
 	fi
 
 	# Do we have any files to fetch, then we fetch them
 	if [[ "${#FILES_TO_FETCH}" -gt 0 ]]; then
-		safe_gcloud "storage cp $FILES_TO_FETCH $(get_p4_root)" 
+		local GCLOUD_OUTPUT=$(safe_gcloud "storage cp $FILES_TO_FETCH $(get_p4_root)" true)
+		local FILES=$(echo -e "$GCLOUD_OUTPUT" | grep -Po "^Copying gs://(.*) to file://\K(.*)$" | tr '\n' ' ')
+		set_perforce_permissions "$FILES"
 	else
 		verbose_log "Neither license nor server.id to fetch"
 	fi
 }
 
 function fetch_checkpoint_and_md5() {
+	verbose_log "Fetching latest checkpoint and md5..."
 	local CHECKPOINT_FILE_VAR="$1"
 
 	# Declare local variable that doesn't change the $?
@@ -727,11 +823,14 @@ function fetch_checkpoint_and_md5() {
 	local MD5_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.md5$")
 
 	safe_command "gzip -df $CHECKPOINT_FILE"
-	
-	verify_checkpoint "${CHECKPOINT_FILE%.gz}"
+	CHECKPOINT_FILE=`realpath "${CHECKPOINT_FILE%.gz}"`
+		
+	verify_checkpoint "$CHECKPOINT_FILE"
 
 	# Set the variables passed into the function of the parent scope
-	eval "$CHECKPOINT_FILE_VAR=`realpath ${CHECKPOINT_FILE%.gz}`"
+	eval "$CHECKPOINT_FILE_VAR=$CHECKPOINT_FILE"
+
+	set_perforce_permissions "$CHECKPOINT_FILE $CHECKPOINT_FILE.md5"
 }
 
 function fetch_versioned_files() {
@@ -741,16 +840,21 @@ function fetch_versioned_files() {
 
 	safe_gcloud "storage rsync -r $GS_BASE_PATH/archives $P4ROOT/$ARCHIVES_DIR" true
 	# Permissions might have changed after downloading the files
-	safe_command "chmod 700 -R $P4ROOT/$ARCHIVES_DIR"
+	set_perforce_permissions "$P4ROOT/$ARCHIVES_DIR" "-R"
 }
 
 function restore_db_and_files() {
 	# How to restore is specified here: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.damage.html
+	require_param "_GCLOUD_PROJECT" "--gcloud_project"
 
 	# Require root, as we will install packages with apt
 	if is_root -eq "0" ; then
 		force_exit_msg "Require root to run restore_db_and_files"
 	fi
+
+	verbose_log "Authenticating with google cloud storage..."
+	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(backup_account_cred_file)" true
+	safe_gcloud "config set project $_GCLOUD_PROJECT"
 
 	# REQUIRES:
 	# 1. Last checkpoint file and .md5 file
@@ -759,26 +863,37 @@ function restore_db_and_files() {
 	# Steps:
 	# 1. RECOVER DATABASE
 	# 1.1. Stop the p4d server
-	p4_service "stop"
+	verbose_log "Stopping the p4d service..."
+	run_p4dctl "stop"
 	# 1.2. Rename (or move) the corrupt database (db.*) files
 	temporary_backup_bad_db
 	# 1.3.1 Restore checkpoint and md5
 	local CHECKPOINT_FILE_REF
 	fetch_checkpoint_and_md5 CHECKPOINT_FILE_REF
 	# 1.3.2 Get the license and server id
-	fetch_license_and_server_id
-	# 1.4. Invoke p4d with the -jr (journal-restore) flag, specifying only your most recent checkpoint
-	safe_command "p4d $_P4_CASE -r $(get_p4_root) -jr $CHECKPOINT_FILE_REF" true
+	fetch_license_and_server_id "$_FETCH_LICENSE"
+	# 1.4. Invoke p4d with the -jr (journal-restore) flag, specifying only your most recent checkpoint as the perforce user
+	run_p4d "$_P4_CASE -r $(get_p4_root) -jr $CHECKPOINT_FILE_REF" true
+	set_perforce_permissions "$(get_p4_root)" "-R"
 	# 2. Recover versioned files
 	fetch_versioned_files
-	# 3. Check your system
-	# Start the system again so we can read p4 counter lastCheckpointAction
-	p4_service "start"
-	LAST_CHECKPOINT_ACTION=$(safe_command "p4 counter lastCheckpointAction")
-	show_var LAST_CHECKPOINT_ACTION
+	# 3. Start system again
+	run_p4dctl "start"
 
-	# Remember to do: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-recovery-ensuring-integrity.html
+	# 4. Check your system
+	# 4.1 Check lastCheckpointAction when it was completed 
+	LAST_CHECKPOINT_ACTION=$(run_p4 "counter lastCheckpointAction" false)
+	if ask_yes_no_question "'p4 counter lastCheckpointAction' gave output:\n'$LAST_CHECKPOINT_ACTION'\n after database restore, this is this date and time of last checkpoint, does this look resonable?" -eq "0"; then
+		force_exit_msg "Restore was unsuccessful =/... Please do it manually according to: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.damage.html"
+	fi
 
+	# 4.2 Verify all files on the depot and all shelved files
+	verbose_log "Verifying files to ensure that the backup was successful..."
+	run_p4 "verify -q //..."
+	# @TODO: Verify that this really works too!
+	run_p4 "verify -q -S //..."
+
+	# 5. If everything was successful, then we can delete the corrupted db.* files
 	remove_bad_db_backup
 }
 
