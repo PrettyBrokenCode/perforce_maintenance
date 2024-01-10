@@ -149,6 +149,28 @@ function force_exit() {
 	kill -s TERM $TOP_PID
 }
 
+# from https://stackoverflow.com/a/62757929
+function callstack() { 
+	local i=1 max_depth=-1 line file func skip_first
+	# First parameter determines how many layers of callers we want to skip at start
+	if [[ "$#" -ge 1 ]]; then
+		i="$1"
+	fi
+	if [[ "$#" -ge 2 ]]; then
+		max_depth="$2"
+	fi
+
+	while read -r line func file < <(caller $i); do
+		echo "[$i] $file:$line $func(): $(sed -n ${line}p $file)"
+
+		if [[ "$max_depth" -ne "-1" && "$i" -ge "$max_depth" ]]; then
+			break
+		fi
+
+		((i++))
+	done
+}
+
 function verbose_log() {
 	local MESSAGE="$1"
 	if [[ "$_VERBOSE" -ne 0 ]]; then
@@ -193,7 +215,7 @@ function safe_command() {
 	# Declare local variable that doesn't change the $?
 	declare -I COMMAND_OUTPUT
 	COMMAND_OUTPUT=$(eval "$COMMAND 2>&1")
-	check_returncode_with_msg $? "Failed to run: '$COMMAND' with error:\n$COMMAND_OUTPUT"
+	check_returncode_with_msg $? "Failed to run: '$COMMAND' with error:\n$COMMAND_OUTPUT\n$(callstack)"
 	if [[ $PRINT_RESULT = true ]]; then
 		echo -e "$COMMAND_OUTPUT"
 	fi
@@ -204,7 +226,12 @@ function safe_command_as() {
 	local USER="$1"; shift
 	local PRINT_RESULT=${1:-false}
 
-	safe_command "sudo -u $USER $COMMAND" "$PRINT_RESULT"
+	local USER_SWITCH_COMMAND=""
+	if [[ "$(whoami)" != "$USER" ]]; then
+		USER_SWITCH_COMMAND="sudo -u $USER"
+	fi
+
+	safe_command "$USER_SWITCH_COMMAND $COMMAND" "$PRINT_RESULT"
 }
 
 function safe_gcloud() {
@@ -242,10 +269,10 @@ function get_p4_port() {
 function get_p4config_value() {
 	local CONFIG_VAR="$1"; shift
 	local STRICT=${1:-true}; shift
-	local PRINT_RESULT=${1:-true}
+	local PRINT_ERROR=${1:-true}
 	
 	# Get config value
-	local CONFIG_OUTPUT=`p4 configure show $CONFIG_VAR 2>&1`
+	local CONFIG_OUTPUT=$(run_p4 "configure show $CONFIG_VAR" "$STRICT")
 	# if the above command output contains "No configurables have been set for server", then
 	# we it's a error. Can't use return value as it's always 0
 
@@ -272,7 +299,7 @@ function get_p4config_value() {
         if $STRICT; then
 			force_exit_msg "$ERROR_MSG"
 		else
-			if $PRINT_RESULT; then
+			if $PRINT_ERROR; then
 				echoerr "$ERROR_MSG"
 			fi
 		fi
@@ -300,7 +327,9 @@ function _p4_internal() {
 	if [[ "$SAFE" = false ]]; then
 		func_name="run_as"
 	fi
-	$func_name "$EXECUTABLE -p $(get_p4_port) -u $_P4_USER $COMMAND" "perforce" "$PRINT_RESULT"
+
+	local CAPTURE_STRING="2>&1"
+	$func_name "$EXECUTABLE -p $(get_p4_port) -u $_P4_USER $COMMAND $CAPTURE_STRING" "perforce" "$PRINT_RESULT"
 }
 
 function run_p4() {
@@ -310,7 +339,7 @@ function run_p4() {
 	local SAFE=${1:-true}; shift
 	local PRINT_RESULT=${1:-true}
 
-	_p4_internal "p4" "-P $_P4_TICKET $COMMAND" "$SAFE" "$PRINT_RESULT"
+	_p4_internal "p4" "-P $_P4_TICKET $COMMAND" "$SAFE" "$PRINT_RESULT" "$CAPTURE_ALL"
 }
 
 function run_p4d() {
@@ -318,7 +347,9 @@ function run_p4d() {
 	local SAFE=${1:-true}; shift
 	local PRINT_RESULT=${1:-true}
 
-	_p4_internal "p4d" "$COMMAND" "$SAFE" "$PRINT_RESULT"
+	local P4_ROOT=$(get_p4_root)
+
+	_p4_internal "p4d" "-r \"$P4_ROOT\" $COMMAND" "$SAFE" "$PRINT_RESULT" "$CAPTURE_ALL"
 }
 
 function run_p4dctl() {
@@ -406,27 +437,6 @@ function backup_account_cred_file() {
 	echo "/opt/perforce/backup_key.json"
 }
 
-# from https://stackoverflow.com/a/62757929
-function callstack() { 
-	local i=1 max_depth=-1 line file func skip_first
-	# First parameter determines how many layers of callers we want to skip at start
-	if [[ "$#" -ge 1 ]]; then
-		i="$1"
-	fi
-	if [[ "$#" -ge 2 ]]; then
-		max_depth="$2"
-	fi
-
-	while read -r line func file < <(caller $i); do
-		echo >&2 "[$i] $file:$line $func(): $(sed -n ${line}p $file)"
-
-		if [[ "$max_depth" -ne "-1" && "$i" -ge "$max_depth" ]]; then
-			break
-		fi
-
-		((i++))
-	done
-}
 
 # @returns 1 on yes and 0 on no
 function ask_yes_no_question() {
@@ -490,7 +500,6 @@ function require_param() {
 
 
 function temporary_backup_bad_db() {
-	set +x
 	local P4ROOT=$(get_p4_root)
 
 	verbose_log "Making backup of db-files to /tmp/perforce_restore/..."
@@ -638,16 +647,15 @@ function nightly_backup() {
 
 
 	local P4ROOT=$(get_p4config_value P4ROOT)
-	# @TODO: Change this so that P4ROOT is passed into the command instead
-	eval "export P4ROOT=$P4ROOT"
 
 	local JOURNAL_DIR=$(get_p4_journal_dir)
-
 	local ARCHIVES_DIR=$(get_p4_archives_dir)
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
-	local CHECKPOINT_OUTPUT=$(safe_command "p4d -jc -z" true)
+
+	
+	local CHECKPOINT_OUTPUT=$(run_p4d "-jc -z" true)
 
 	# 2. Ensure the checkpointing was successful
 	local JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< $CHECKPOINT_OUTPUT`
@@ -655,7 +663,7 @@ function nightly_backup() {
 	
 	verbose_log "Validating journal file was correctly written to disk..."
 	# Validate journal file
-	safe_command "p4d -jv \"$P4ROOT/$JOURNAL_BACKUP_FILE\"" false
+	run_p4d "-jv \"$P4ROOT/$JOURNAL_BACKUP_FILE\"" true false
 	# 3. Confirm checkpoint was correctly written to disk with md5
 	gzip -dk "$P4ROOT/$JOURNAL_BACKUP_FILE"
 
@@ -686,15 +694,19 @@ function nightly_backup() {
 	# 	checkpoint + md5, rotated journal file
 	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$JOURNAL_DIR" $GS_BASE_PATH/journals" true
 	#	license file
-	verbose_log "Sending license to google cloud..."
-	safe_gcloud "storage cp "$P4ROOT/license" $GS_BASE_PATH/license" true
+	if [ -f $P4ROOT/license ]; then
+		verbose_log "Sending license to google cloud..."
+		safe_gcloud "storage cp "$P4ROOT/license" $GS_BASE_PATH/license" true
+	fi
 	#	versioned files
 	verbose_log "Sending content to google cloud..."
 	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$ARCHIVES_DIR" $GS_BASE_PATH/archives" true
 
 	# 6. backup the server.id
-	verbose_log "Sending server.id to google cloud..."
-	safe_gcloud "storage cp "$P4ROOT/server.id" $GS_BASE_PATH/server.id" true
+	if [ -f $P4ROOT/server.id ]; then
+		verbose_log "Sending server.id to google cloud..."
+		safe_gcloud "storage cp "$P4ROOT/server.id" $GS_BASE_PATH/server.id" true
+	fi
 
 	verbose_log "Nightly backup succeeded"
 }
@@ -703,9 +715,9 @@ function weekly_verification() {
 	require_param "_P4_TICKET" "-t|--p4_ticket"
 
 	# 1. Verify archive files
-	safe_command "p4 verify -q //..."
+	run_p4 "verify -q //..."
 	# 2. Verify shelved files 
-	safe_command "p4 verify -q -S //..."
+	run_p4 "verify -q -S //..."
 
 	verbose_log "Weekly verification succeeded"
 }
@@ -873,7 +885,7 @@ function restore_db_and_files() {
 	# 1.3.2 Get the license and server id
 	fetch_license_and_server_id "$_FETCH_LICENSE"
 	# 1.4. Invoke p4d with the -jr (journal-restore) flag, specifying only your most recent checkpoint as the perforce user
-	run_p4d "$_P4_CASE -r $(get_p4_root) -jr $CHECKPOINT_FILE_REF" true
+	run_p4d "$_P4_CASE -jr $CHECKPOINT_FILE_REF" true
 	set_perforce_permissions "$(get_p4_root)" "-R"
 	# 2. Recover versioned files
 	fetch_versioned_files
@@ -947,18 +959,13 @@ if [[ "$_GCLOUD_SETUP" -eq 1 ]]; then
 	gcloud_setup
 fi
 
+# Different restoremodes to run
 case "$_RESTORE" in
 	db) 
 		restore_db ;;
 	db_and_files) 
 		restore_db_and_files ;;
-	*) 
-		force_exit_msg "Managed to pass in unknown restore mode... WTH!"
 esac
-
-if [[ "$_RESTORE" -eq 1 ]]; then
-	restore
-fi
 
 if [[ "$_NIGHTLY" -eq 1 ]]; then
 	nightly_backup
