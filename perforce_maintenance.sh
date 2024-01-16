@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
+TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -71,7 +71,7 @@ while true; do
 			esac ;;
 		-m|--mail)
 			case $2 in
-				"") echo "No mail provided, discarding parameter"; shift 2 ;;
+				"") echo "No mail receiver provided, discarding parameter"; shift 2 ;;
 				*) _NOTIFICATION_RECIPIENTS="$2"; shift 2 ;;
 			esac ;;
 		--mail_sender)
@@ -181,8 +181,8 @@ function verbose_log() {
 function force_exit_msg() {
 	local MESSAGE="$1"
 
-	sendmail "$MESSAGE"
 	echoerr "$MESSAGE"
+	send_mail "$MESSAGE"
 
 	force_exit
 }
@@ -197,8 +197,10 @@ function is_root() {
 	return 0
 }
 
-function sendmail() {
+function send_mail() {
 	local MESSAGE="$1"
+
+	echo -e "Sending notification to: '$_NOTIFICATION_RECIPIENTS'"
 
 	# Verify that we have specified the notification recipient
 	if [[ "$_NOTIFICATION_RECIPIENTS" != -1 ]]; then
@@ -433,8 +435,8 @@ function get_backup_role_absolute_path() {
 	echo "projects/$_GCLOUD_PROJECT/roles/$_GCLOUD_BACKUP_ROLE"
 }
 
-function backup_account_cred_file() {
-	echo "/opt/perforce/backup_key.json"
+function gs_backup_account_cred_file() {
+	echo "/opt/perforce/backup/gs_backup_user_key.json"
 }
 
 
@@ -622,10 +624,10 @@ function gcloud_setup() {
 	fi
 
 	# @TODO: Check if the key if for the current backup user, and if not, delete old key and download a new key
-	if [[ ! -f "$(backup_account_cred_file)" ]]; then
+	if [[ ! -f "$(gs_backup_account_cred_file)" ]]; then
 		verbose_log "Downloading credentials file for service-account"
-		safe_gcloud "iam service-accounts keys create $(backup_account_cred_file) --iam-account=$(get_backup_account_mail)" true
-		chmod 600 /opt/perforce/backup_key.json
+		safe_gcloud "iam service-accounts keys create $(gs_backup_account_cred_file) --iam-account=$(get_backup_account_mail)" true
+		set_perforce_permissions "$(gs_backup_account_cred_file)"
 	else
 		verbose_log "Skipping downloading of credentials as it's already downloaded"
 	fi
@@ -685,7 +687,7 @@ function nightly_backup() {
 	# 5. Backup
 	# Set correct project in google cloud
 	verbose_log "Authenticating with google cloud storage..."
-	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(backup_account_cred_file)" true
+	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(gs_backup_account_cred_file)" true
 	safe_gcloud "config set project $_GCLOUD_PROJECT"
 
 	local GS_BASE_PATH=$(get_gs_bucket_base_path)
@@ -865,7 +867,7 @@ function restore_db_and_files() {
 	fi
 
 	verbose_log "Authenticating with google cloud storage..."
-	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(backup_account_cred_file)" true
+	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(gs_backup_account_cred_file)" true
 	safe_gcloud "config set project $_GCLOUD_PROJECT"
 
 	# REQUIRES:
@@ -907,15 +909,28 @@ function restore_db_and_files() {
 
 	# 5. If everything was successful, then we can delete the corrupted db.* files
 	remove_bad_db_backup
+
+	verbose_log "Restoration of db and files complete!"
 }
 
 function setup() {
 	require_param "_MAIL_SENDER" "--mail_sender"
 	require_param "_MAIL_TOKEN" "--mail_token"
 
+	require_param "_GCLOUD_PROJECT" "--gcloud_project"
+	require_param "_GCLOUD_BUCKET" "--gcloud_bucket"
+	require_param "_GCLOUD_BACKUP_USER" "--gcloud_backup_user"
+	require_param "_P4_TICKET" "-t|--p4_ticket"
+
 	# Require root, as we will install packages with apt
 	if is_root -eq "0" ; then
 		force_exit_msg "Require root to run setup"
+	fi
+
+	if [[ "$_NOTIFICATION_RECIPIENTS" == "-1" ]]; then
+		if ask_yes_no_question "No mail notification recepients specified, continue anyway?" -eq 0; then
+			force_exit_msg "Quitting for user to specify mail recepients"
+		fi
 	fi
 
 	# Required for us to download signing keys for google cloud
@@ -933,22 +948,67 @@ function setup() {
 	# Add google cloud repo
 	echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
 	# Install google cloud
-	apt-get update && apt-get install google-cloud-cli jq
+	apt-get update && apt-get install google-cloud-cli jq -y
 
+	# AuthPass is setup here: https://myaccount.google.com/u/1/apppasswords
 	# Install ssmtp for sending mail through gmail
 	apt install ssmtp -y
 	echo "mailhub=smtp.gmail.com:587
-	useSTARTTLS=YES
-	AuthUser=$_MAIL_SENDER
-	AuthPass=$_MAIL_TOKEN
-	TLS_CA_File=/etc/pki/tls/certs/ca-bundle.crt
-	FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
+useSTARTTLS=YES
+AuthUser=$_MAIL_SENDER
+AuthPass=$_MAIL_TOKEN
+FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
+# TLS_CA_File=/etc/pki/tls/certs/ca-bundle.crt
+
 
 	# Ensure the correct permissions for ssmtp files
 	chown root:mail /etc/ssmtp/ssmtp.conf
+	# This file contains a mail token, so only allow root to read it
 	chmod 640 /etc/ssmtp/ssmtp.conf
+	# Add the perforce user to the mail group so that it can send mail
+	usermod -a -G mail perforce
 
+	# Install the script so that cron can access it
+	local SCRIPT_FILENAME=$(realpath "$0")
+	local INSTALLED_PATH=/usr/sbin/$(basename "$0")
+
+	safe_command "cp $SCRIPT_FILENAME $INSTALLED_PATH"
+	safe_command "chmod 774 $INSTALLED_PATH"
+	safe_command "chown perforce:perforce $INSTALLED_PATH"
+
+	local PERFORCE_TICKET_FILE=/opt/perforce/backup/perforce_ticket.txt
+
+	# Ensure that there is a /opt/perforce/backup directory with correct permissions
+	if [ ! -d /opt/perforce/backup ]; then
+		mkdir /opt/perforce/backup
+		set_perforce_permissions  "/opt/perforce/backup" "-R"
+	fi
+
+	cat <<EOF > $PERFORCE_TICKET_FILE
+$_P4_TICKET
+EOF
+	set_perforce_permissions "$PERFORCE_TICKET_FILE"
+	# IS HERE! NEED TO ENSURE THAT THE PERFORCE USER CAN READ /etc/pki/tls/certs/ca-bundle.crt
+
+	local MAINTENENCE_USER="perforce"
+
+	# For explaination on crontab, see https://crontab.guru/#02_1_*_*_1-5,0
+	local NIGHTLY_MAINTENENCE_TIME="2 1 * * 1-5,0"
+	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --gcloud_project=$_GCLOUD_PROJECT --gcloud_bucket=$_GCLOUD_BUCKET --gcloud_backup_user=$_GCLOUD_BACKUP_USER -t \`cat $PERFORCE_TICKET_FILE\` -m $_NOTIFICATION_RECIPIENTS"
+	
+	# For explaination on crontab, see https://crontab.guru/#2_1_*_*_6
+	local WEEKLY_MAINTENENCE_TIME="2 1 * * 6"
+	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly --gcloud_project=$_GCLOUD_PROJECT --gcloud_bucket=$_GCLOUD_BUCKET --gcloud_backup_user=$_GCLOUD_BACKUP_USER -t \`cat $PERFORCE_TICKET_FILE\` -m $_NOTIFICATION_RECIPIENTS"
+
+	echo 'MAILTO=""' > "/etc/cron.d/perforce_maintenance"
+	echo "$NIGHTLY_MAINTENENCE_TIME $MAINTENENCE_USER $NIGHTLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
+	echo "$WEEKLY_MAINTENENCE_TIME $MAINTENENCE_USER $WEEKLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
+
+	# @todonow: test nightly + weekly
+	safe_command "chmod 640 /etc/cron.d/perforce_maintenance"
 	# @TODO: Setup when backupscripts is run, move the backupscript into place etc
+
+	verbose_log "Setup is complete"
 }
 
 if [[ "$_SETUP" -eq 1 ]]; then
@@ -967,10 +1027,10 @@ case "$_RESTORE" in
 		restore_db_and_files ;;
 esac
 
-if [[ "$_NIGHTLY" -eq 1 ]]; then
-	nightly_backup
-fi
-
 if [[ "$_WEEKLY" -eq 1 ]]; then
 	weekly_verification
+fi
+
+if [[ "$_NIGHTLY" -eq 1 ]]; then
+	nightly_backup
 fi
