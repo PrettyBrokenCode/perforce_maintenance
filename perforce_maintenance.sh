@@ -988,7 +988,6 @@ FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
 $_P4_TICKET
 EOF
 	set_perforce_permissions "$PERFORCE_TICKET_FILE"
-	# IS HERE! NEED TO ENSURE THAT THE PERFORCE USER CAN READ /etc/pki/tls/certs/ca-bundle.crt
 
 	local MAINTENENCE_USER="perforce"
 
@@ -1004,9 +1003,7 @@ EOF
 	echo "$NIGHTLY_MAINTENENCE_TIME $MAINTENENCE_USER $NIGHTLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
 	echo "$WEEKLY_MAINTENENCE_TIME $MAINTENENCE_USER $WEEKLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
 
-	# @todonow: test nightly + weekly
 	safe_command "chmod 640 /etc/cron.d/perforce_maintenance"
-	# @TODO: Setup when backupscripts is run, move the backupscript into place etc
 
 	verbose_log "Setup is complete"
 }
