@@ -581,7 +581,6 @@ function gcloud_setup() {
 	
 	# If the backup role doesn't exist, create it
 	if [[ "$?" -eq "1" ]]; then
-		# @TODO: Verify that permissions are set correctly
 		verbose_log "Creating backup role with correct permissions"
 		gc_safe_gcloud "iam roles create $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
 	else
@@ -619,8 +618,29 @@ function gcloud_setup() {
 		safe_command "mkdir /opt/perforce/" true
 	fi
 
-	# @TODO: Check if the key if for the current backup user, and if not, delete old key and download a new key
+	# Verify that the file is exists and is for the correct project...
+	local KEY_IS_OUTDATED=false
 	if [[ ! -f "$(gc_backup_account_cred_file)" ]]; then
+		KEY_IS_OUTDATED=true
+	else
+		local PROJECT_ID=`jq -r '.project_id' $(gc_backup_account_cred_file)`
+		if [[ "$PROJECT_ID" != "$_GCLOUD_PROJECT" ]]; then
+			verbose_log "Key is for the wrong project... $PROJECT_ID"
+			KEY_IS_OUTDATED=true
+		fi
+		local CLIENT_EMAIL=`jq -r '.client_email' $(gc_backup_account_cred_file)`
+		if [[ "$CLIENT_EMAIL" != "$(gc_get_backup_account_mail)" ]]; then
+			verbose_log "Key is for the wrong account... $CLIENT_EMAIL"
+			KEY_IS_OUTDATED=true
+		fi
+
+		if $KEY_IS_OUTDATED; then
+			verbose_log "Deleting old key as it's outdated"
+			safe_command "rm -f $(gc_backup_account_cred_file)" true
+		fi
+	fi
+
+	if $KEY_IS_OUTDATED; then
 		verbose_log "Downloading credentials file for service-account"
 		gc_safe_gcloud "iam service-accounts keys create $(gc_backup_account_cred_file) --iam-account=$(gc_get_backup_account_mail)" true
 		set_perforce_permissions "$(gc_backup_account_cred_file)"
@@ -651,8 +671,7 @@ function nightly_backup() {
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
-
-	
+		
 	local CHECKPOINT_OUTPUT=$(p4d_run "-jc -z" true)
 
 	# 2. Ensure the checkpointing was successful
