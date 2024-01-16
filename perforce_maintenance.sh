@@ -135,10 +135,6 @@ if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETU
 	exit -1
 fi
 
-# @TODO: Move all variables that's export into the call of perforce instead of using environment variables and make helper function p4 and safe_p4
-export P4PASSWD="$_P4_TICKET"
-export P4USER=$_P4_USER
-
 # Ensure that we can quit in the middle of a function by running exit 1 if we catches the TERM signal
 trap "exit 1" TERM
 export TOP_PID=$$
@@ -151,21 +147,16 @@ function force_exit() {
 
 # from https://stackoverflow.com/a/62757929
 function callstack() { 
-	local i=1 max_depth=-1 line file func skip_first
-	# First parameter determines how many layers of callers we want to skip at start
-	if [[ "$#" -ge 1 ]]; then
-		i="$1"
-	fi
-	if [[ "$#" -ge 2 ]]; then
-		max_depth="$2"
-	fi
+	local i=${1:-1}; shift
+	local max_depth=${1:--1}; shift
+	local line file func skip_first
 
 	while read -r line func file < <(caller $i); do
-		echo "[$i] $file:$line $func(): $(sed -n ${line}p $file)"
-
 		if [[ "$max_depth" -ne "-1" && "$i" -ge "$max_depth" ]]; then
 			break
 		fi
+
+		echo "[$i] $file:$line $func(): $(sed -n ${line}p $file)"
 
 		((i++))
 	done
@@ -199,8 +190,6 @@ function is_root() {
 
 function send_mail() {
 	local MESSAGE="$1"
-
-	echo -e "Sending notification to: '$_NOTIFICATION_RECIPIENTS'"
 
 	# Verify that we have specified the notification recipient
 	if [[ "$_NOTIFICATION_RECIPIENTS" != -1 ]]; then
@@ -237,8 +226,7 @@ function safe_command_as() {
 }
 
 function safe_gcloud() {
-	local COMMAND="$1"
-	shift
+	local COMMAND="$1";	shift
 	local PRINT_RESULT=${1:-false}
 
 	safe_command "gcloud $COMMAND -q" "$PRINT_RESULT"
@@ -249,8 +237,7 @@ function safe_gcloud() {
 # @param 1 the element to check if it's present in the array
 # @param 2 the array to check in
 function contains_element() {
-	local ITR TO_MATCH="$1"
-	shift
+	local ITR TO_MATCH="$1"; shift
 
 	for ITR; do [[ "$ITR" == "$TO_MATCH" ]] && return 0; done
 	return 1
@@ -471,7 +458,7 @@ function from_func() {
 function parse_md5_file_content() {
 	local MD5_FILE_CONTENT="$1"
 
-	echo -e $(sed -nE 's/^MD5 \(.+\) = (.+)$/\1/p' <<< $MD5_FILE_CONTENT)
+	echo -e $(sed -nE 's/^MD5 \(.+\) = (.+)$/\1/p' <<< "$MD5_FILE_CONTENT")
 
 }
 
@@ -751,6 +738,7 @@ function restore_db() {
 	#remove_bad_db_backup
 }
 
+# @return 0 if the file exists, 1 if it doesn't
 function gs_file_exists() {
 	local GS_FILE="$1"
 
@@ -870,10 +858,6 @@ function restore_db_and_files() {
 	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(gs_backup_account_cred_file)" true
 	safe_gcloud "config set project $_GCLOUD_PROJECT"
 
-	# REQUIRES:
-	# 1. Last checkpoint file and .md5 file
-	# 2. Backed up versioned files
-
 	# Steps:
 	# 1. RECOVER DATABASE
 	# 1.1. Stop the p4d server
@@ -904,7 +888,6 @@ function restore_db_and_files() {
 	# 4.2 Verify all files on the depot and all shelved files
 	verbose_log "Verifying files to ensure that the backup was successful..."
 	run_p4 "verify -q //..."
-	# @TODO: Verify that this really works too!
 	run_p4 "verify -q -S //..."
 
 	# 5. If everything was successful, then we can delete the corrupted db.* files
@@ -958,7 +941,6 @@ useSTARTTLS=YES
 AuthUser=$_MAIL_SENDER
 AuthPass=$_MAIL_TOKEN
 FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
-# TLS_CA_File=/etc/pki/tls/certs/ca-bundle.crt
 
 
 	# Ensure the correct permissions for ssmtp files
@@ -999,6 +981,7 @@ EOF
 	local WEEKLY_MAINTENENCE_TIME="2 1 * * 6"
 	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly --gcloud_project=$_GCLOUD_PROJECT --gcloud_bucket=$_GCLOUD_BUCKET --gcloud_backup_user=$_GCLOUD_BACKUP_USER -t \`cat $PERFORCE_TICKET_FILE\` -m $_NOTIFICATION_RECIPIENTS"
 
+	# MAILTO="" is to disable mail sending, as we are using ssmtp in the script to send mail
 	echo 'MAILTO=""' > "/etc/cron.d/perforce_maintenance"
 	echo "$NIGHTLY_MAINTENENCE_TIME $MAINTENENCE_USER $NIGHTLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
 	echo "$WEEKLY_MAINTENENCE_TIME $MAINTENENCE_USER $WEEKLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
