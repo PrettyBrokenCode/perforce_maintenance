@@ -225,12 +225,49 @@ function safe_command_as() {
 	safe_command "$USER_SWITCH_COMMAND $COMMAND" "$PRINT_RESULT"
 }
 
-function safe_gcloud() {
+function gc_safe_gcloud() {
 	local COMMAND="$1";	shift
 	local PRINT_RESULT=${1:-false}
 
 	safe_command "gcloud $COMMAND -q" "$PRINT_RESULT"
 }
+
+
+# @return 0 if the file exists, 1 if it doesn't
+function gc_file_exists() {
+	local GS_FILE="$1"
+
+	gsutil stat $GS_FILE > /dev/null 2>&1
+	return $?
+}
+
+function gc_get_bucket_base_path() {
+	require_param "_GCLOUD_BUCKET" "--gcloud_bucket"
+
+	local SERVER_NAME=$(get_server_name)
+
+	echo -e "gs://$_GCLOUD_BUCKET/$SERVER_NAME"
+}
+
+function gc_get_backup_role_absolute_path() {
+	require_param "_GCLOUD_PROJECT" "--gcloud_project"
+	require_param "_GCLOUD_BACKUP_ROLE" "--gcloud_backup_role"
+
+	echo "projects/$_GCLOUD_PROJECT/roles/$_GCLOUD_BACKUP_ROLE"
+}
+
+function gc_backup_account_cred_file() {
+	echo "/opt/perforce/backup/gs_backup_user_key.json"
+}
+
+
+function gc_get_backup_account_mail() {
+	require_param "_GCLOUD_BACKUP_USER" "--gcloud_backup_user"
+	require_param "_GCLOUD_PROJECT" "--gcloud_project"
+
+	echo "$_GCLOUD_BACKUP_USER@$_GCLOUD_PROJECT.iam.gserviceaccount.com"
+}
+
 
 # checks if a element is present in a array. Ensure that both parameters passed in is enclosed
 #	in ""
@@ -400,32 +437,6 @@ function get_p4_journal_dir() {
 	echo -e "${JOURNAL_FILE%/*}"
 }
 
-function get_backup_account_mail() {
-	require_param "_GCLOUD_BACKUP_USER" "--gcloud_backup_user"
-	require_param "_GCLOUD_PROJECT" "--gcloud_project"
-
-	echo "$_GCLOUD_BACKUP_USER@$_GCLOUD_PROJECT.iam.gserviceaccount.com"
-}
-
-function get_gs_bucket_base_path() {
-	require_param "_GCLOUD_BUCKET" "--gcloud_bucket"
-
-	local SERVER_NAME=$(get_server_name)
-
-	echo -e "gs://$_GCLOUD_BUCKET/$SERVER_NAME"
-}
-
-function get_backup_role_absolute_path() {
-	require_param "_GCLOUD_PROJECT" "--gcloud_project"
-	require_param "_GCLOUD_BACKUP_ROLE" "--gcloud_backup_role"
-
-	echo "projects/$_GCLOUD_PROJECT/roles/$_GCLOUD_BACKUP_ROLE"
-}
-
-function gs_backup_account_cred_file() {
-	echo "/opt/perforce/backup/gs_backup_user_key.json"
-}
-
 
 # @returns 1 on yes and 0 on no
 function ask_yes_no_question() {
@@ -517,7 +528,7 @@ function remove_bad_db_backup() {
 }
 
 function gcloud_setup() {
-	verbose_log "Running SETUP"
+	verbose_log "Running gcloud_setup..."
 
 	require_param "_GCLOUD_USER"			"--gcloud_user"
 	require_param "_GCLOUD_PROJECT"		"--gcloud_project"
@@ -529,32 +540,32 @@ function gcloud_setup() {
 	declare -I GCLOUD_OUTPUT
 
 	# Check if the user is already logged in
-	GCLOUD_OUTPUT=$(safe_gcloud "auth list --filter-account=$_GCLOUD_USER --format=json" true)
+	GCLOUD_OUTPUT=$(gc_safe_gcloud "auth list --filter-account=$_GCLOUD_USER --format=json" true)
 
-	# Need to login, so run interactive prompt (don't use safe_gcloud or safe_command)
+	# Need to login, so run interactive prompt (don't use gc_safe_gcloud or safe_command)
 	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq "0" ]]; then
 		gcloud auth login $_GCLOUD_USER
 		check_returncode_with_msg "$?" "gcloud_setup failed: Failed to login"
 	else
 		verbose_log "Setting account $_GCLOUD_USER"
 		# Set the active account
-		safe_gcloud "config set account $_GCLOUD_USER" true
+		gc_safe_gcloud "config set account $_GCLOUD_USER" true
 	fi
 
 	# Ensure that we are working on the correct project
-	GCLOUD_OUTPUT=$(safe_gcloud "config set project $_GCLOUD_PROJECT" true)
+	GCLOUD_OUTPUT=$(gc_safe_gcloud "config set project $_GCLOUD_PROJECT" true)
 
 	if [[ "$GCLOUD_OUTPUT" == *"WARNING: You do not appear to have access to project [$_GCLOUD_PROJECT] or it does not exist."* ]]; then
 		force_exit_msg "gcloud_setup failed: You don't have permission or the project $_GCLOUD_PROJECT doesn't exist: Error: \n'$GCLOUD_OUTPUT'"
 	fi
 
 	# check if the bucket exists
-	GCLOUD_OUTPUT=$(safe_gcloud "storage buckets list --filter=$_GCLOUD_BUCKET --format=json" true)
+	GCLOUD_OUTPUT=$(gc_safe_gcloud "storage buckets list --filter=$_GCLOUD_BUCKET --format=json" true)
 
 	# Bucket doesn't exist, create it
 	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
 		verbose_log "Creating bucket"
-		safe_gcloud "storage buckets create gs://$_GCLOUD_BUCKET/ \
+		gc_safe_gcloud "storage buckets create gs://$_GCLOUD_BUCKET/ \
 		--uniform-bucket-level-access \
 		--default-storage-class=Standard \
 		--location=EUROPE-NORTH1 \
@@ -574,33 +585,33 @@ function gcloud_setup() {
 	if [[ "$?" -eq "1" ]]; then
 		# @TODO: Verify that permissions are set correctly
 		verbose_log "Creating backup role with correct permissions"
-		safe_gcloud "iam roles create $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
+		gc_safe_gcloud "iam roles create $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
 	else
 		verbose_log "Updating backup role with correct permissions"
-		safe_gcloud "iam roles update $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
+		gc_safe_gcloud "iam roles update $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
 	fi
 
-	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(get_backup_account_mail) 2>&1`
+	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(gc_get_backup_account_mail) 2>&1`
 
 	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
 		# User doesn't exist, create it
-		safe_gcloud "iam service-accounts create $_GCLOUD_BACKUP_USER --display-name=\"Perforce backup user\"" true
+		gc_safe_gcloud "iam service-accounts create $_GCLOUD_BACKUP_USER --display-name=\"Perforce backup user\"" true
 	else
 		verbose_log	"Skipping creating service account as it already exists"
 	fi
 
 	# Get the roles of the service account to verify that the service account has the correct role
-	GCLOUD_OUTPUT=$(safe_gcloud "projects get-iam-policy $_GCLOUD_PROJECT --flatten='bindings[].members' \
+	GCLOUD_OUTPUT=$(gc_safe_gcloud "projects get-iam-policy $_GCLOUD_PROJECT --flatten='bindings[].members' \
 		--format='table(bindings.role)' \
-		--filter='bindings.members:serviceAccount:$(get_backup_account_mail) AND \
-			bindings.role=$(get_backup_role_absolute_path)' --format=json" true)
+		--filter='bindings.members:serviceAccount:$(gc_get_backup_account_mail) AND \
+			bindings.role=$(gc_get_backup_role_absolute_path)' --format=json" true)
 
 	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
 		# Add the role to the service account
-		verbose_log "Adding the role $(get_backup_role_absolute_path) to backup user $(get_backup_account_mail)"
-		safe_gcloud "projects add-iam-policy-binding $_GCLOUD_PROJECT \
-			--role=$(get_backup_role_absolute_path) \
-			--member=serviceAccount:$(get_backup_account_mail)" true
+		verbose_log "Adding the role $(gc_get_backup_role_absolute_path) to backup user $(gc_get_backup_account_mail)"
+		gc_safe_gcloud "projects add-iam-policy-binding $_GCLOUD_PROJECT \
+			--role=$(gc_get_backup_role_absolute_path) \
+			--member=serviceAccount:$(gc_get_backup_account_mail)" true
 	else
 		verbose_log "Skipping adding role to backup user, as it already has it"
 	fi
@@ -611,17 +622,17 @@ function gcloud_setup() {
 	fi
 
 	# @TODO: Check if the key if for the current backup user, and if not, delete old key and download a new key
-	if [[ ! -f "$(gs_backup_account_cred_file)" ]]; then
+	if [[ ! -f "$(gc_backup_account_cred_file)" ]]; then
 		verbose_log "Downloading credentials file for service-account"
-		safe_gcloud "iam service-accounts keys create $(gs_backup_account_cred_file) --iam-account=$(get_backup_account_mail)" true
-		set_perforce_permissions "$(gs_backup_account_cred_file)"
+		gc_safe_gcloud "iam service-accounts keys create $(gc_backup_account_cred_file) --iam-account=$(gc_get_backup_account_mail)" true
+		set_perforce_permissions "$(gc_backup_account_cred_file)"
 	else
 		verbose_log "Skipping downloading of credentials as it's already downloaded"
 	fi
 
 	if [[ "$_NO_REVOKE" -ne "0" ]]; then
 		# Revoke our credentials so that they don't stay on the server by accident
-		safe_gcloud "auth revoke $_GCLOUD_USER"
+		gc_safe_gcloud "auth revoke $_GCLOUD_USER"
 	fi
 
 	force_exit
@@ -674,27 +685,27 @@ function nightly_backup() {
 	# 5. Backup
 	# Set correct project in google cloud
 	verbose_log "Authenticating with google cloud storage..."
-	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(gs_backup_account_cred_file)" true
-	safe_gcloud "config set project $_GCLOUD_PROJECT"
+	gc_safe_gcloud "auth login $(gc_get_backup_account_mail) --cred-file=$(gc_backup_account_cred_file)" true
+	gc_safe_gcloud "config set project $_GCLOUD_PROJECT"
 
-	local GS_BASE_PATH=$(get_gs_bucket_base_path)
+	local GS_BASE_PATH=$(gc_get_bucket_base_path)
 
 	verbose_log "Sending journals and checkpoints to google cloud..."
 	# 	checkpoint + md5, rotated journal file
-	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$JOURNAL_DIR" $GS_BASE_PATH/journals" true
+	gc_safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$JOURNAL_DIR" $GS_BASE_PATH/journals" true
 	#	license file
 	if [ -f $P4ROOT/license ]; then
 		verbose_log "Sending license to google cloud..."
-		safe_gcloud "storage cp "$P4ROOT/license" $GS_BASE_PATH/license" true
+		gc_safe_gcloud "storage cp "$P4ROOT/license" $GS_BASE_PATH/license" true
 	fi
 	#	versioned files
 	verbose_log "Sending content to google cloud..."
-	safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$ARCHIVES_DIR" $GS_BASE_PATH/archives" true
+	gc_safe_gcloud "storage rsync --delete-unmatched-destination-objects -r "$P4ROOT/$ARCHIVES_DIR" $GS_BASE_PATH/archives" true
 
 	# 6. backup the server.id
 	if [ -f $P4ROOT/server.id ]; then
 		verbose_log "Sending server.id to google cloud..."
-		safe_gcloud "storage cp "$P4ROOT/server.id" $GS_BASE_PATH/server.id" true
+		gc_safe_gcloud "storage cp "$P4ROOT/server.id" $GS_BASE_PATH/server.id" true
 	fi
 
 	verbose_log "Nightly backup succeeded"
@@ -738,13 +749,6 @@ function restore_db() {
 	#remove_bad_db_backup
 }
 
-# @return 0 if the file exists, 1 if it doesn't
-function gs_file_exists() {
-	local GS_FILE="$1"
-
-	gsutil stat $GS_FILE > /dev/null 2>&1
-	return $?
-}
 
 function run_as() {
 	local COMMAND="$1"; shift
@@ -785,19 +789,19 @@ function fetch_license_and_server_id() {
 	local FETCH_LICENSE=${1:-true}
 
 	local FILES_TO_FETCH=""
-	if gs_file_exists "$(get_gs_bucket_base_path)/server.id" -eq 0; then
-		FILES_TO_FETCH="$(get_gs_bucket_base_path)/server.id"
+	if gc_file_exists "$(gc_get_bucket_base_path)/server.id" -eq 0; then
+		FILES_TO_FETCH="$(gc_get_bucket_base_path)/server.id"
 	fi
 
 	if $FETCH_LICENSE; then
-		if gs_file_exists "$(get_gs_bucket_base_path)/license" -eq 0; then
-			FILES_TO_FETCH="$FILES_TO_FETCH $(get_gs_bucket_base_path)/license"
+		if gc_file_exists "$(gc_get_bucket_base_path)/license" -eq 0; then
+			FILES_TO_FETCH="$FILES_TO_FETCH $(gc_get_bucket_base_path)/license"
 		fi
 	fi
 
 	# Do we have any files to fetch, then we fetch them
 	if [[ "${#FILES_TO_FETCH}" -gt 0 ]]; then
-		local GCLOUD_OUTPUT=$(safe_gcloud "storage cp $FILES_TO_FETCH $(get_p4_root)" true)
+		local GCLOUD_OUTPUT=$(gc_safe_gcloud "storage cp $FILES_TO_FETCH $(get_p4_root)" true)
 		local FILES=$(echo -e "$GCLOUD_OUTPUT" | grep -Po "^Copying gs://(.*) to file://\K(.*)$" | tr '\n' ' ')
 		set_perforce_permissions "$FILES"
 	else
@@ -811,15 +815,15 @@ function fetch_checkpoint_and_md5() {
 
 	# Declare local variable that doesn't change the $?
 	declare -I GCLOUD_RESULT
-	local BASE_PATH=$(get_gs_bucket_base_path)
-	GCLOUD_RESULT=$(safe_gcloud "storage ls $BASE_PATH/journals/" true)
+	local BASE_PATH=$(gc_get_bucket_base_path)
+	GCLOUD_RESULT=$(gc_safe_gcloud "storage ls $BASE_PATH/journals/" true)
 	
 	local LATEST_CHECKPOINT=$(echo -e "$GCLOUD_RESULT" | grep -E "^.*\.ckp\.(\d*).*\.gz$" | sort -t . -k 3n | tail -1)
 	local LATEST_MD5=$(echo -e "${LATEST_CHECKPOINT%gz}md5")
 
 	local P4ROOT="$(get_p4_root)"
 	local P4JOURNAL_DIR="$P4ROOT/$(get_p4_journal_dir)"
-	GCLOUD_RESULT=$(safe_gcloud "storage cp $LATEST_CHECKPOINT $LATEST_MD5 $P4JOURNAL_DIR" true)
+	GCLOUD_RESULT=$(gc_safe_gcloud "storage cp $LATEST_CHECKPOINT $LATEST_MD5 $P4JOURNAL_DIR" true)
 	
 	local CHECKPOINT_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.gz$")
 	local MD5_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.md5$")
@@ -836,11 +840,11 @@ function fetch_checkpoint_and_md5() {
 }
 
 function fetch_versioned_files() {
-	local GS_BASE_PATH=$(get_gs_bucket_base_path)
+	local GS_BASE_PATH=$(gc_get_bucket_base_path)
 	local P4ROOT=$(get_p4_root)
 	local ARCHIVES_DIR=$(get_p4_archives_dir)
 
-	safe_gcloud "storage rsync -r $GS_BASE_PATH/archives $P4ROOT/$ARCHIVES_DIR" true
+	gc_safe_gcloud "storage rsync -r $GS_BASE_PATH/archives $P4ROOT/$ARCHIVES_DIR" true
 	# Permissions might have changed after downloading the files
 	set_perforce_permissions "$P4ROOT/$ARCHIVES_DIR" "-R"
 }
@@ -855,8 +859,8 @@ function restore_db_and_files() {
 	fi
 
 	verbose_log "Authenticating with google cloud storage..."
-	safe_gcloud "auth login $(get_backup_account_mail) --cred-file=$(gs_backup_account_cred_file)" true
-	safe_gcloud "config set project $_GCLOUD_PROJECT"
+	gc_safe_gcloud "auth login $(gc_get_backup_account_mail) --cred-file=$(gc_backup_account_cred_file)" true
+	gc_safe_gcloud "config set project $_GCLOUD_PROJECT"
 
 	# Steps:
 	# 1. RECOVER DATABASE
