@@ -244,7 +244,7 @@ function gc_file_exists() {
 function gc_get_bucket_base_path() {
 	require_param "_GCLOUD_BUCKET" "--gcloud_bucket"
 
-	local SERVER_NAME=$(get_server_name)
+	local SERVER_NAME=$(p4_get_server_name)
 
 	echo -e "gs://$_GCLOUD_BUCKET/$SERVER_NAME"
 }
@@ -280,11 +280,86 @@ function contains_element() {
 	return 1
 }
 
-function get_p4_port() {
+function p4_get_port() {
 	local ETH_ADAPTER=eth0
 	local IP_ADDR=`ip a s $ETH_ADAPTER | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
 	# @TODO: Make this configurable
 	echo "$IP_ADDR:1666"
+}
+
+function _p4_internal() {
+	require_param "_P4_USER" "--p4_user"
+	
+	local EXECUTABLE="$1"; shift
+	local COMMAND="$1"; shift
+	local SAFE="$1"; shift
+	local PRINT_RESULT="$1"
+
+	local func_name="safe_command_as"
+	if [[ "$SAFE" = false ]]; then
+		func_name="run_as"
+	fi
+
+	local CAPTURE_STRING="2>&1"
+	$func_name "$EXECUTABLE -p $(p4_get_port) -u $_P4_USER $COMMAND $CAPTURE_STRING" "perforce" "$PRINT_RESULT"
+}
+
+function p4_run() {
+	require_param "_P4_TICKET" "--p4_ticket"
+
+	local COMMAND="$1"; shift
+	local SAFE=${1:-true}; shift
+	local PRINT_RESULT=${1:-true}
+
+	_p4_internal "p4" "-P $_P4_TICKET $COMMAND" "$SAFE" "$PRINT_RESULT" "$CAPTURE_ALL"
+}
+
+function p4d_run() {
+	local COMMAND="$1"; shift
+	local SAFE=${1:-true}; shift
+	local PRINT_RESULT=${1:-true}
+
+	local P4_ROOT=$(p4_get_root)
+
+	_p4_internal "p4d" "-r \"$P4_ROOT\" $COMMAND" "$SAFE" "$PRINT_RESULT" "$CAPTURE_ALL"
+}
+
+function p4dctl_run() {
+	local ACTION="$1"
+	
+	if is_root -eq "0" ; then
+		force_exit_msg "Require root to control system service helix-p4dctl"
+	fi
+
+	case "$ACTION" in
+		"start") ;& # Fallthrough
+		"stop") ;& # Fallthrough
+		"restart") ;;
+		*) force_exit_msg "Unknown actions '$ACTION' passed to p4dctl" ;;
+	esac
+	
+	safe_command "systemctl $ACTION helix-p4dctl"
+}
+
+function p4_get_root() {
+	# Declare local variable that doesn't change the $?
+	declare -I P4ROOT
+	P4ROOT=$(p4_get_config_value P4ROOT false false)
+	if [[ $? != 0 ]]; then	
+		require_param "_P4_ROOT" "--p4_root"
+		P4ROOT=$_P4_ROOT
+	fi
+	echo $P4ROOT
+}
+
+function p4_get_archives_dir() {
+	declare -I ARCHIVES_DIR
+	ARCHIVES_DIR=$(p4_get_config_value server.depot.root false false)
+	if [[ $? -ne 0 ]]; then
+		require_param "_P4_ARCHIVES_DIR" "--p4_archive_dir"
+		ARCHIVES_DIR="$_P4_ARCHIVES_DIR"
+	fi
+	echo -e "$ARCHIVES_DIR"
 }
 
 # Helper function to get p4 config values, takes 1-2 parameters
@@ -292,13 +367,13 @@ function get_p4_port() {
 # @param 2 if false, we are not operating in strict mode, and will not terminate the
 #       application if the config variable doesn't exist
 # @param 3 if false, then we don't print the output of p4 configure show. Only valid if strict is false
-function get_p4config_value() {
+function p4_get_config_value() {
 	local CONFIG_VAR="$1"; shift
 	local STRICT=${1:-true}; shift
 	local PRINT_ERROR=${1:-true}
 	
 	# Get config value
-	local CONFIG_OUTPUT=$(run_p4 "configure show $CONFIG_VAR" "$STRICT")
+	local CONFIG_OUTPUT=$(p4_run "configure show $CONFIG_VAR" "$STRICT")
 	# if the above command output contains "No configurables have been set for server", then
 	# we it's a error. Can't use return value as it's always 0
 
@@ -341,81 +416,32 @@ function get_p4config_value() {
 	return 0
 }
 
-function _p4_internal() {
-	require_param "_P4_USER" "--p4_user"
-	
-	local EXECUTABLE="$1"; shift
-	local COMMAND="$1"; shift
-	local SAFE="$1"; shift
-	local PRINT_RESULT="$1"
-
-	local func_name="safe_command_as"
-	if [[ "$SAFE" = false ]]; then
-		func_name="run_as"
-	fi
-
-	local CAPTURE_STRING="2>&1"
-	$func_name "$EXECUTABLE -p $(get_p4_port) -u $_P4_USER $COMMAND $CAPTURE_STRING" "perforce" "$PRINT_RESULT"
-}
-
-function run_p4() {
-	require_param "_P4_TICKET" "--p4_ticket"
-
-	local COMMAND="$1"; shift
-	local SAFE=${1:-true}; shift
-	local PRINT_RESULT=${1:-true}
-
-	_p4_internal "p4" "-P $_P4_TICKET $COMMAND" "$SAFE" "$PRINT_RESULT" "$CAPTURE_ALL"
-}
-
-function run_p4d() {
-	local COMMAND="$1"; shift
-	local SAFE=${1:-true}; shift
-	local PRINT_RESULT=${1:-true}
-
-	local P4_ROOT=$(get_p4_root)
-
-	_p4_internal "p4d" "-r \"$P4_ROOT\" $COMMAND" "$SAFE" "$PRINT_RESULT" "$CAPTURE_ALL"
-}
-
-function run_p4dctl() {
-	local ACTION="$1"
-	
-	if is_root -eq "0" ; then
-		force_exit_msg "Require root to control system service helix-p4dctl"
-	fi
-
-	case "$ACTION" in
-		"start") ;& # Fallthrough
-		"stop") ;& # Fallthrough
-		"restart") ;;
-		*) force_exit_msg "Unknown actions '$ACTION' passed to p4dctl" ;;
-	esac
-	
-	safe_command "systemctl $ACTION helix-p4dctl"
-}
-
-function get_p4_root() {
-	# Declare local variable that doesn't change the $?
-	declare -I P4ROOT
-	P4ROOT=$(get_p4config_value P4ROOT false false)
-	if [[ $? != 0 ]]; then	
-		require_param "_P4_ROOT" "--p4_root"
-		P4ROOT=$_P4_ROOT
-	fi
-	echo $P4ROOT
-}
-
-function get_p4_archives_dir() {
-	declare -I ARCHIVES_DIR
-	ARCHIVES_DIR=$(get_p4config_value server.depot.root false false)
+function p4_get_journal_dir() {
+	declare -I JOURNAL_FILE
+	JOURNAL_FILE=$(p4_get_config_value P4JOURNAL false false)
 	if [[ $? -ne 0 ]]; then
-		require_param "_P4_ARCHIVES_DIR" "--p4_archive_dir"
-		ARCHIVES_DIR="$_P4_ARCHIVES_DIR"
+		require_param "_P4_JOURNAL" "--p4_journal"
+		JOURNAL_FILE=$_P4_JOURNAL
 	fi
-	echo -e "$ARCHIVES_DIR"
+
+	echo -e "${JOURNAL_FILE%/*}"
 }
 
+function p4_get_server_name() {
+	local P4ROOT=$(p4_get_root)
+
+	local SERVER_NAME=$_SERVER_NAME
+
+	# If no --server_name was provided, then we set one
+	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
+		# For some reason, p4 configure show serverid doesn't work, even thou it shows up when running p4 configure show
+		SERVER_NAME=$(safe_command "cat $P4ROOT/server.id" true)
+	fi
+	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
+		force_exit_msg "No server name is set, please pass in --server_name to ensure that you know where your backup is stored"
+	fi
+	echo $SERVER_NAME
+}
 
 function check_returncode_with_msg() {
 	local RETURN_CODE=$1
@@ -425,18 +451,6 @@ function check_returncode_with_msg() {
 		force_exit_msg "$ERROR_MESSAGE"
 	fi
 }
-
-function get_p4_journal_dir() {
-	declare -I JOURNAL_FILE
-	JOURNAL_FILE=$(get_p4config_value P4JOURNAL false false)
-	if [[ $? -ne 0 ]]; then
-		require_param "_P4_JOURNAL" "--p4_journal"
-		JOURNAL_FILE=$_P4_JOURNAL
-	fi
-
-	echo -e "${JOURNAL_FILE%/*}"
-}
-
 
 # @returns 1 on yes and 0 on no
 function ask_yes_no_question() {
@@ -473,22 +487,6 @@ function parse_md5_file_content() {
 
 }
 
-function get_server_name() {
-	local P4ROOT=$(get_p4_root)
-
-	local SERVER_NAME=$_SERVER_NAME
-
-	# If no --server_name was provided, then we set one
-	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
-		# For some reason, p4 configure show serverid doesn't work, even thou it shows up when running p4 configure show
-		SERVER_NAME=$(safe_command "cat $P4ROOT/server.id" true)
-	fi
-	if [[ "$SERVER_NAME" -eq "-1" || $SERVER_NAME = "" ]]; then
-		force_exit_msg "No server name is set, please pass in --server_name to ensure that you know where your backup is stored"
-	fi
-	echo $SERVER_NAME
-}
-
 function require_param() {
 	local VARNAME="$1"
 	local PARAMETER_NAME="$2"
@@ -500,7 +498,7 @@ function require_param() {
 
 
 function temporary_backup_bad_db() {
-	local P4ROOT=$(get_p4_root)
+	local P4ROOT=$(p4_get_root)
 
 	verbose_log "Making backup of db-files to /tmp/perforce_restore/..."
 	run_as "mkdir /tmp/perforce_restore" "perforce" false
@@ -646,16 +644,16 @@ function nightly_backup() {
 	require_param "_P4_TICKET" "-t|--p4_ticket"
 
 
-	local P4ROOT=$(get_p4config_value P4ROOT)
+	local P4ROOT=$(p4_get_config_value P4ROOT)
 
-	local JOURNAL_DIR=$(get_p4_journal_dir)
-	local ARCHIVES_DIR=$(get_p4_archives_dir)
+	local JOURNAL_DIR=$(p4_get_journal_dir)
+	local ARCHIVES_DIR=$(p4_get_archives_dir)
 	
 	# 1. Make checkpoint and ensure that it was successful
 	verbose_log "Making checkpoint..."
 
 	
-	local CHECKPOINT_OUTPUT=$(run_p4d "-jc -z" true)
+	local CHECKPOINT_OUTPUT=$(p4d_run "-jc -z" true)
 
 	# 2. Ensure the checkpointing was successful
 	local JOURNAL_BACKUP_FILE=`sed -nE 's/^Checkpointing to (.+)...$/\1/p' <<< $CHECKPOINT_OUTPUT`
@@ -663,7 +661,7 @@ function nightly_backup() {
 	
 	verbose_log "Validating journal file was correctly written to disk..."
 	# Validate journal file
-	run_p4d "-jv \"$P4ROOT/$JOURNAL_BACKUP_FILE\"" true false
+	p4d_run "-jv \"$P4ROOT/$JOURNAL_BACKUP_FILE\"" true false
 	# 3. Confirm checkpoint was correctly written to disk with md5
 	gzip -dk "$P4ROOT/$JOURNAL_BACKUP_FILE"
 
@@ -715,9 +713,9 @@ function weekly_verification() {
 	require_param "_P4_TICKET" "-t|--p4_ticket"
 
 	# 1. Verify archive files
-	run_p4 "verify -q //..."
+	p4_run "verify -q //..."
 	# 2. Verify shelved files 
-	run_p4 "verify -q -S //..."
+	p4_run "verify -q -S //..."
 
 	verbose_log "Weekly verification succeeded"
 }
@@ -801,7 +799,7 @@ function fetch_license_and_server_id() {
 
 	# Do we have any files to fetch, then we fetch them
 	if [[ "${#FILES_TO_FETCH}" -gt 0 ]]; then
-		local GCLOUD_OUTPUT=$(gc_safe_gcloud "storage cp $FILES_TO_FETCH $(get_p4_root)" true)
+		local GCLOUD_OUTPUT=$(gc_safe_gcloud "storage cp $FILES_TO_FETCH $(p4_get_root)" true)
 		local FILES=$(echo -e "$GCLOUD_OUTPUT" | grep -Po "^Copying gs://(.*) to file://\K(.*)$" | tr '\n' ' ')
 		set_perforce_permissions "$FILES"
 	else
@@ -821,8 +819,8 @@ function fetch_checkpoint_and_md5() {
 	local LATEST_CHECKPOINT=$(echo -e "$GCLOUD_RESULT" | grep -E "^.*\.ckp\.(\d*).*\.gz$" | sort -t . -k 3n | tail -1)
 	local LATEST_MD5=$(echo -e "${LATEST_CHECKPOINT%gz}md5")
 
-	local P4ROOT="$(get_p4_root)"
-	local P4JOURNAL_DIR="$P4ROOT/$(get_p4_journal_dir)"
+	local P4ROOT="$(p4_get_root)"
+	local P4JOURNAL_DIR="$P4ROOT/$(p4_get_journal_dir)"
 	GCLOUD_RESULT=$(gc_safe_gcloud "storage cp $LATEST_CHECKPOINT $LATEST_MD5 $P4JOURNAL_DIR" true)
 	
 	local CHECKPOINT_FILE=$(echo -e "$GCLOUD_RESULT" | grep -Eo "$P4JOURNAL_DIR/(\w+)\.(\w+)\.[0-9]+\.gz$")
@@ -841,8 +839,8 @@ function fetch_checkpoint_and_md5() {
 
 function fetch_versioned_files() {
 	local GS_BASE_PATH=$(gc_get_bucket_base_path)
-	local P4ROOT=$(get_p4_root)
-	local ARCHIVES_DIR=$(get_p4_archives_dir)
+	local P4ROOT=$(p4_get_root)
+	local ARCHIVES_DIR=$(p4_get_archives_dir)
 
 	gc_safe_gcloud "storage rsync -r $GS_BASE_PATH/archives $P4ROOT/$ARCHIVES_DIR" true
 	# Permissions might have changed after downloading the files
@@ -866,7 +864,7 @@ function restore_db_and_files() {
 	# 1. RECOVER DATABASE
 	# 1.1. Stop the p4d server
 	verbose_log "Stopping the p4d service..."
-	run_p4dctl "stop"
+	p4dctl_run "stop"
 	# 1.2. Rename (or move) the corrupt database (db.*) files
 	temporary_backup_bad_db
 	# 1.3.1 Restore checkpoint and md5
@@ -875,24 +873,24 @@ function restore_db_and_files() {
 	# 1.3.2 Get the license and server id
 	fetch_license_and_server_id "$_FETCH_LICENSE"
 	# 1.4. Invoke p4d with the -jr (journal-restore) flag, specifying only your most recent checkpoint as the perforce user
-	run_p4d "$_P4_CASE -jr $CHECKPOINT_FILE_REF" true
-	set_perforce_permissions "$(get_p4_root)" "-R"
+	p4d_run "$_P4_CASE -jr $CHECKPOINT_FILE_REF" true
+	set_perforce_permissions "$(p4_get_root)" "-R"
 	# 2. Recover versioned files
 	fetch_versioned_files
 	# 3. Start system again
-	run_p4dctl "start"
+	p4dctl_run "start"
 
 	# 4. Check your system
 	# 4.1 Check lastCheckpointAction when it was completed 
-	LAST_CHECKPOINT_ACTION=$(run_p4 "counter lastCheckpointAction" false)
+	LAST_CHECKPOINT_ACTION=$(p4_run "counter lastCheckpointAction" false)
 	if ask_yes_no_question "'p4 counter lastCheckpointAction' gave output:\n'$LAST_CHECKPOINT_ACTION'\n after database restore, this is this date and time of last checkpoint, does this look resonable?" -eq "0"; then
 		force_exit_msg "Restore was unsuccessful =/... Please do it manually according to: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup.recovery.damage.html"
 	fi
 
 	# 4.2 Verify all files on the depot and all shelved files
 	verbose_log "Verifying files to ensure that the backup was successful..."
-	run_p4 "verify -q //..."
-	run_p4 "verify -q -S //..."
+	p4_run "verify -q //..."
+	p4_run "verify -q -S //..."
 
 	# 5. If everything was successful, then we can delete the corrupted db.* files
 	remove_bad_db_backup
