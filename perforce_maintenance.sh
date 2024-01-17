@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r: -l no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
+TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r: -l checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -26,6 +26,9 @@ _NIGHTLY=0
 _WEEKLY=0
 _SETUP=0
 _RESTORE=0
+
+_MAINTENENCE_CHECKPOINT_MIN_NUM=14
+_MAINTENENCE_CHECKPOINT_MAX_AGE_IN_DAYS=31
 
 _MAIL_SENDER=-1
 _MAIL_TOKEN=-1
@@ -58,6 +61,16 @@ while true; do
 			case $2 in
 				"") echo "No P4ROOT provided, discarding parameter"; shift 2 ;;
 				*) _P4_ROOT="$2"; shift 2 ;;
+			esac ;;
+		--checkpoint_max_age)
+			case $2 in
+				"") echo "No max age for checkpoints provided, discarding parameter"; shift 2 ;;
+				*) _MAINTENENCE_CHECKPOINT_MAX_AGE_IN_DAYS="$2"; shift 2 ;;
+			esac ;;
+		--checkpoint_min_number)
+			case $2 in
+				"") echo "No minimum number of checkpoints specified, discarding parameter"; shift 2 ;;
+				*) _MAINTENENCE_CHECKPOINT_MIN_NUM="$2"; shift 2 ;;
 			esac ;;
 		--p4_archive_dir)
 			case $2 in
@@ -656,6 +669,22 @@ function gcloud_setup() {
 	force_exit
 }
 
+function trim_checkpoints() {
+	local P4ROOT=$(p4_get_root)
+	local JOURNAL_DIR=$(p4_get_journal_dir)
+
+	local CURRENT_TIME_SECONDS=$(date +%s)
+
+	ls "$P4ROOT/$JOURNAL_DIR" | grep -E ".*\.ckp\.[0-9]*\.gz$" | sort -t . -k 3n | head -n -$_MAINTENENCE_CHECKPOINT_MIN_NUM | while read -r CHECKPOINT_FILE; do
+		local NUM_DAYS_OLD=$(( (CURRENT_TIME_SECONDS - $(stat -c %Y "$P4ROOT/$JOURNAL_DIR/$CHECKPOINT_FILE")) / 86400 )) # 86400 seconds in a day
+		if [ $NUM_DAYS_OLD -gt $_MAINTENENCE_CHECKPOINT_MAX_AGE_IN_DAYS ]; then
+			verbose_log "Removing old checkpoint file $CHECKPOINT_FILE"
+			safe_command "rm -f $P4ROOT/$JOURNAL_DIR/$CHECKPOINT_FILE"
+			safe_command "rm -f $P4ROOT/$JOURNAL_DIR/$CHECKPOINT_FILE.md5"
+		fi
+	done
+}
+
 function nightly_backup() {
 	# Reference: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-procedure.html
 	require_param "_GCLOUD_PROJECT" "--gcloud_project"
@@ -663,8 +692,7 @@ function nightly_backup() {
 	require_param "_GCLOUD_BACKUP_USER" "--gcloud_backup_user"
 	require_param "_P4_TICKET" "-t|--p4_ticket"
 
-
-	local P4ROOT=$(p4_get_config_value P4ROOT)
+	local P4ROOT=$(p4_get_root)
 
 	local JOURNAL_DIR=$(p4_get_journal_dir)
 	local ARCHIVES_DIR=$(p4_get_archives_dir)
@@ -693,12 +721,11 @@ function nightly_backup() {
 	verify_checkpoint "$JOURNAL_BACKUP_FILE_WITHOUT_GZ"
 
 	# Remove the extracted file that we used to verify the md5 of
-	rm -f "$JOURNAL_BACKUP_FILE_WITHOUT_GZ"
+	safe_command "rm -f \"$JOURNAL_BACKUP_FILE_WITHOUT_GZ\""
 
 	# 4. Trim down amount of checkpoints stored locally on the server
-	# @TODO: IMPLEMENT
+	trim_checkpoints
 	
-
 	# 5. Backup
 	# Set correct project in google cloud
 	verbose_log "Authenticating with google cloud storage..."
