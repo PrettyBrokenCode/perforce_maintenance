@@ -944,6 +944,17 @@ function restore_db_and_files() {
 	verbose_log "Restoration of db and files complete!"
 }
 
+function disable_default_maintenance() {
+	verbose_log "Disabling default maintenance..."
+
+	ls /etc/perforce/p4dctl.conf.d/ | grep -E ".*\.conf$" | while read -r FILE; do
+		safe_command "sed -i 's/^\s*MAINTENANCE\s*=\s*true$/        MAINTENANCE =\tfalse/' /etc/perforce/p4dctl.conf.d/$FILE"
+	done
+
+	verbose_log "Restarting p4dctl..."
+	p4dctl_run "restart"
+}
+
 function setup() {
 	require_param "_MAIL_SENDER" "--mail_sender"
 	require_param "_MAIL_TOKEN" "--mail_token"
@@ -1035,6 +1046,8 @@ EOF
 	echo "$WEEKLY_MAINTENENCE_TIME $MAINTENENCE_USER $WEEKLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
 
 	safe_command "chmod 640 /etc/cron.d/perforce_maintenance"
+
+	disable_default_maintenance
 
 	verbose_log "Setup is complete"
 }
