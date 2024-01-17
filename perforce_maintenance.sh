@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r: -l checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
+TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r: -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -17,6 +17,8 @@ _P4_ROOT=-1
 _P4_JOURNAL=-1
 _P4_CASE="-C0"
 _P4_ARCHIVES_DIR=-1
+_P4_TCP_PORT=1666
+_P4_ADAPTER=-1
 
 _FETCH_LICENSE=true
 _VERBOSE=0
@@ -61,6 +63,16 @@ while true; do
 			case $2 in
 				"") echo "No P4ROOT provided, discarding parameter"; shift 2 ;;
 				*) _P4_ROOT="$2"; shift 2 ;;
+			esac ;;
+		--p4_tcp_port)
+			case $2 in
+				"") echo "No tcp-port provided, discarding parameter"; shift 2 ;;
+				*) _P4_TCP_PORT="$2"; shift 2 ;;
+			esac ;;
+		--p4_adapter)
+			case $2 in
+				"") echo "No adapter provided, discarding parameter"; shift 2 ;;
+				*) _P4_ADAPTER="$2"; shift 2 ;;
 			esac ;;
 		--checkpoint_max_age)
 			case $2 in
@@ -289,15 +301,39 @@ function gc_get_backup_account_mail() {
 function contains_element() {
 	local ITR TO_MATCH="$1"; shift
 
-	for ITR; do [[ "$ITR" == "$TO_MATCH" ]] && return 0; done
+	for ITR; do 
+		if [[ "$ITR" == "$TO_MATCH" ]]; then
+			return 0; 
+		fi
+	done
 	return 1
 }
 
+function get_adapter() {
+	echo -e $(ip link show | awk -F: '$0 !~ "wg|lo|vir|wl|^[^0-9]"{sub(/^ /, "", $2); print $2; getline}')
+}
+
 function p4_get_port() {
-	local ETH_ADAPTER=eth0
+	local ETH_ADAPTER="$_P4_ADAPTER"
+	if [[ "$ETH_ADAPTER" -eq "-1" ]]; then
+		ETH_ADAPTER=$(get_adapter)
+	else
+		local EXISTING_ADAPTERS=$(get_adapter)
+		mapfile -t EXISTING_ADAPTERS_ARRAY <<< "$EXISTING_ADAPTERS"
+		if ! contains_element "$ETH_ADAPTER" "${EXISTING_ADAPTERS_ARRAY[@]}"; then
+			force_exit_msg "Non existing ethernet adapter passed in, please pass in a valid adapter with --adapter"			
+		fi
+	fi
+
+	local NUM_ADAPTERS=$(echo -e "$ETH_ADAPTER" | wc -l)
+
+	if [ "$NUM_ADAPTERS" -gt 1 ]; then
+		force_exit_msg "Got more than one ethernet adapter, please pass in --adapter"
+	elif [ "$NUM_ADAPTERS" -eq 0 ]; then
+		force_exit_msg "Failed to get any ethernet adapter... Check server configuration"
+	fi
 	local IP_ADDR=`ip a s $ETH_ADAPTER | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
-	# @TODO: Make this configurable
-	echo "$IP_ADDR:1666"
+	echo "$IP_ADDR:$_P4_TCP_PORT"
 }
 
 function _p4_internal() {
