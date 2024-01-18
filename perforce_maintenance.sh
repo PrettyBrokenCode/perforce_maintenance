@@ -623,7 +623,7 @@ function gcloud_setup() {
 	fi
 
 	# The required permission of the backup role
-	local REQUIRED_PERMISSIONS="storage.objects.list,storage.objects.create,storage.objects.delete,storage.objects.get"
+	local REQUIRED_PERMISSIONS="storage.objects.list,storage.objects.create,storage.objects.delete,storage.objects.get,storage.buckets.get"
 	local ROLE_COMMAND="$_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS --stage=ALPHA"
 
 	# Check if the role exists
@@ -722,21 +722,29 @@ function trim_checkpoints() {
 	done
 }
 
-function wait_for_permission_propagation() {
+function wait_for_permission() {
+	local COMMAND="$1"
+	local DESCRIPTION="$2"
+
 	local PERMISSION_PROPAGATION=1 # Success is 0
 	local RETRIES=0
 	while true; do
-		if ! gcloud storage objects list gs://$_GCLOUD_BUCKET/* --limit=1 &> /dev/null; then
+		if ! gcloud $COMMAND &> /dev/null; then
 			if [[ "$RETRIES" -gt 42 ]]; then
-				force_exit_msg "Permissions hasn't propagated within 7 minutes... Aborting backup..."
+				force_exit_msg "$DESCRIPTION hasn't propagated within 7 minutes... Aborting backup..."
 			fi
 			((RETRIES++))
-			verbose_log "Waiting for permission propagation. Waiting 10 seconds before retrying (Retry '$RETRIES')..."
+			verbose_log "Waiting for ${DESCRIPTION,,} propagation. Waiting 10 seconds before retrying (Retry $RETRIES)..."
 			sleep 10
 		else
 			break
 		fi
 	done
+}
+
+function wait_for_permission_propagation() {
+	wait_for_permission "storage objects list gs://$_GCLOUD_BUCKET/* --limit=1" "Object permissions"
+	wait_for_permission "storage buckets describe gs://$_GCLOUD_BUCKET" "Bucket permissions"
 }
 
 function nightly_backup() {
@@ -807,6 +815,11 @@ function nightly_backup() {
 	if [ -f $P4ROOT/server.id ]; then
 		verbose_log "Sending server.id to google cloud..."
 		gc_safe_gcloud "storage cp "$P4ROOT/server.id" $GS_BASE_PATH/server.id" true
+	fi
+
+	if [[ "$_NO_REVOKE" -ne "0" ]]; then
+		# Revoke our credentials so that they don't stay on the server by accident
+		gc_safe_gcloud "auth revoke $_GCLOUD_USER"
 	fi
 
 	verbose_log "Nightly backup succeeded"
