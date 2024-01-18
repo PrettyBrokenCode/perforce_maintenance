@@ -624,17 +624,18 @@ function gcloud_setup() {
 
 	# The required permission of the backup role
 	local REQUIRED_PERMISSIONS="storage.objects.list,storage.objects.create,storage.objects.delete,storage.objects.get"
+	local ROLE_COMMAND="$_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS --stage=ALPHA"
 
 	# Check if the role exists
-	gcloud iam roles describe $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT > /dev/null
+	gcloud iam roles describe $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT &> /dev/null
 	
 	# If the backup role doesn't exist, create it
 	if [[ "$?" -eq "1" ]]; then
 		verbose_log "Creating backup role with correct permissions"
-		gc_safe_gcloud "iam roles create $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
+		gc_safe_gcloud "iam roles create $ROLE_COMMAND" true
 	else
 		verbose_log "Updating backup role with correct permissions"
-		gc_safe_gcloud "iam roles update $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS" true
+		gc_safe_gcloud "iam roles update $ROLE_COMMAND" true
 	fi
 
 	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(gc_get_backup_account_mail) 2>&1`
@@ -695,7 +696,7 @@ function gcloud_setup() {
 		set_perforce_permissions "$(gc_backup_account_cred_file)"
 	else
 		verbose_log "Skipping downloading of credentials as it's already downloaded"
-	fi
+	fi	
 
 	if [[ "$_NO_REVOKE" -ne "0" ]]; then
 		# Revoke our credentials so that they don't stay on the server by accident
@@ -717,6 +718,23 @@ function trim_checkpoints() {
 			verbose_log "Removing old checkpoint file $CHECKPOINT_FILE"
 			safe_command "rm -f $P4ROOT/$JOURNAL_DIR/$CHECKPOINT_FILE"
 			safe_command "rm -f $P4ROOT/$JOURNAL_DIR/$CHECKPOINT_FILE.md5"
+		fi
+	done
+}
+
+function wait_for_permission_propagation() {
+	local PERMISSION_PROPAGATION=1 # Success is 0
+	local RETRIES=0
+	while true; do
+		if ! gcloud storage objects list gs://$_GCLOUD_BUCKET/* --limit=1 &> /dev/null; then
+			if [[ "$RETRIES" -gt 42 ]]; then
+				force_exit_msg "Permissions hasn't propagated within 7 minutes... Aborting backup..."
+			fi
+			((RETRIES++))
+			verbose_log "Waiting for permission propagation. Waiting 10 seconds before retrying (Retry '$RETRIES')..."
+			sleep 10
+		else
+			break
 		fi
 	done
 }
@@ -767,6 +785,9 @@ function nightly_backup() {
 	verbose_log "Authenticating with google cloud storage..."
 	gc_safe_gcloud "auth login $(gc_get_backup_account_mail) --cred-file=$(gc_backup_account_cred_file)" true
 	gc_safe_gcloud "config set project $_GCLOUD_PROJECT"
+
+	# If running this script right after you have setup the user and role, then we need to wait for the permission to propagate from IAM to STORAGE
+	wait_for_permission_propagation
 
 	local GS_BASE_PATH=$(gc_get_bucket_base_path)
 
