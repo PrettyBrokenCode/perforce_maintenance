@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r: -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
+TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r:,i -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -23,6 +23,7 @@ _P4_ADAPTER=-1
 _FETCH_LICENSE=true
 _VERBOSE=0
 _NO_REVOKE=0
+_INTERACTIVE=0
 
 _NIGHTLY=0
 _WEEKLY=0
@@ -47,6 +48,7 @@ while true; do
 	case "$1" in
 		-n|--nightly) _NIGHTLY=1; shift ;;
 		-w|--weekly) _WEEKLY=1; shift ;;
+		-i|--interactive) _INTERACTIVE=1; shift ;;
 		--gcloud_setup) _GCLOUD_SETUP=1; shift ;;
 		-v|--verbose) _VERBOSE=1; shift ;;
 		--no_revoke) _NO_REVOKE=1; shift ;;
@@ -154,7 +156,7 @@ while true; do
     esac
 done
 
-if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 ]]; then
+if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 && "$_INTERACTIVE" -ne 0 ]]; then
 	echoerr "Either nightly, weekly, setup, restore or weekly_setup needs to be set for the backupscript to run"
 	echoerr "EXITING!"
 	exit -1
@@ -222,6 +224,10 @@ function send_mail() {
 	else
 		verbose_log "No notification recipient specified, no mail sent"
 	fi
+}
+
+function get_config_file() {
+	echo "/opt/perforce/backup/maintenance_conf.json"
 }
 
 function safe_command() {
@@ -1121,6 +1127,53 @@ EOF
 
 	verbose_log "Setup is complete"
 }
+
+function read_config_file(){
+	# Read the config file
+
+	echo "Config-file: $(get_config_file)"
+
+	if [[ ! -f $(get_config_file) ]]; then
+		run_as "touch $(get_config_file)" "perforce"
+		set_perforce_permissions "$(get_config_file)"
+	fi
+
+	# Read the config file
+	# local PROJECT_ID=`jq -r '.project_id' $(gc_backup_account_cred_file)`
+}
+
+function print_interactive_menu() {
+	clear
+	echo "Select option:"
+	echo "1. Setup cloud provider (uninplemented)"
+	echo "2. Setup computer (uninplemented)"
+	echo "3. Restore perforce backup (uninplemented)"
+	echo "4. Make backup (uninplemented)"
+	echo "5. Verify integrity (uninplemented)"
+	echo "6. Exit"
+}
+
+function interactive(){
+	read_config_file
+
+	while true; do
+		print_interactive_menu
+		read OPTION
+		case $OPTION in
+			1) ;; #gcloud_setup ;;
+			2) ;; #setup ;;
+			3) ;; #restore_db ;;
+			4) ;; #nightly_backup ;;
+			5) ;; #weekly_verification ;;
+			6) exit 0 ;;
+			*) echo "Invalid option" ;;
+		esac
+	done
+}
+
+if [[ "$_INTERACTIVE" -eq 1 ]]; then
+	interactive
+fi
 
 if [[ "$_SETUP" -eq 1 ]]; then
 	setup
