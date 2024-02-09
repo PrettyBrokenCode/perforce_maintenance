@@ -1129,28 +1129,21 @@ FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
 	safe_command "chmod 774 $INSTALLED_PATH"
 	safe_command "chown perforce:perforce $INSTALLED_PATH"
 
-	local PERFORCE_TICKET_FILE=/opt/perforce/backup/perforce_ticket.txt
-
 	# Ensure that there is a /opt/perforce/backup directory with correct permissions
 	if [ ! -d /opt/perforce/backup ]; then
 		mkdir /opt/perforce/backup
 		set_perforce_permissions  "/opt/perforce/backup" "-R"
 	fi
 
-	cat <<EOF > $PERFORCE_TICKET_FILE
-$_P4_TICKET
-EOF
-	set_perforce_permissions "$PERFORCE_TICKET_FILE"
-
 	local MAINTENENCE_USER="perforce"
 
 	# For explaination on crontab, see https://crontab.guru/#02_1_*_*_1-5,0
 	local NIGHTLY_MAINTENENCE_TIME="2 1 * * 1-5,0"
-	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --gcloud_project=$_GCLOUD_PROJECT --gcloud_bucket=$_GCLOUD_BUCKET --gcloud_backup_user=$_GCLOUD_BACKUP_USER -t \`cat $PERFORCE_TICKET_FILE\` -m $_NOTIFICATION_RECIPIENTS"
+	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly"
 	
 	# For explaination on crontab, see https://crontab.guru/#2_1_*_*_6
 	local WEEKLY_MAINTENENCE_TIME="2 1 * * 6"
-	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly --gcloud_project=$_GCLOUD_PROJECT --gcloud_bucket=$_GCLOUD_BUCKET --gcloud_backup_user=$_GCLOUD_BACKUP_USER -t \`cat $PERFORCE_TICKET_FILE\` -m $_NOTIFICATION_RECIPIENTS"
+	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly"
 
 	# MAILTO="" is to disable mail sending, as we are using ssmtp in the script to send mail
 	echo 'MAILTO=""' > "/etc/cron.d/perforce_maintenance"
@@ -1174,18 +1167,26 @@ function read_config_file() {
 	fi
 
 	# Read the config file
-	_GCLOUD_PROJECT=`jq -r		'.project_id' $(get_config_file)`
-	_GCLOUD_BUCKET=`jq -r		'.bucket' $(get_config_file)`
-	_GCLOUD_BACKUP_USER=`jq -r	'.backup_user' $(get_config_file)`
-	_GCLOUD_BACKUP_ROLE=`jq -r	'.backup_role' $(get_config_file)`
+	_GCLOUD_PROJECT=`jq -r			'.project_id' $(get_config_file)`
+	_GCLOUD_BUCKET=`jq -r			'.bucket' $(get_config_file)`
+	_GCLOUD_BACKUP_USER=`jq -r		'.backup_user' $(get_config_file)`
+	_GCLOUD_BACKUP_ROLE=`jq -r		'.backup_role' $(get_config_file)`
+	_MAIL_SENDER=`jq -r				'.mail_sender' $(get_config_file)`
+	_MAIL_TOKEN=`jq -r				'.mail_token' $(get_config_file)`
+	_NOTIFICATION_RECIPIENTS=`jq -r	'.notification_recipients' $(get_config_file)`
+	_P4_TICKET=`jq -r				'.p4_ticket' $(get_config_file)`
 }
 
 function update_config_file() {
 	run_as "echo -e \"{
-    \\\"project_id\\\": \\\"$_GCLOUD_PROJECT\\\",
-    \\\"bucket\\\": \\\"$_GCLOUD_BUCKET\\\",
-    \\\"backup_user\\\": \\\"$_GCLOUD_BACKUP_USER\\\",
-    \\\"backup_role\\\": \\\"$_GCLOUD_BACKUP_ROLE\\\"
+	\\\"project_id\\\": \\\"$_GCLOUD_PROJECT\\\",
+	\\\"bucket\\\": \\\"$_GCLOUD_BUCKET\\\",
+	\\\"backup_user\\\": \\\"$_GCLOUD_BACKUP_USER\\\",
+	\\\"backup_role\\\": \\\"$_GCLOUD_BACKUP_ROLE\\\",
+	\\\"mail_sender\\\": \\\"$_MAIL_SENDER\\\",
+	\\\"mail_token\\\": \\\"$_MAIL_TOKEN\\\",
+	\\\"notification_recipients\\\": \\\"$_NOTIFICATION_RECIPIENTS\\\",
+	\\\"p4_ticket\\\": \\\"$_P4_TICKET\\\"
 }\" > $(get_config_file)" "perforce"
 	set_perforce_permissions "$(get_config_file)"
 }
@@ -1307,7 +1308,7 @@ function interactive_setup_cloud_provider() {
 		read OPTION
 		case $OPTION in
 			1) BAD_OPTION=false; interactive_update_glcoud_settings ;;
-			2) BAD_OPTION=true; interactive_setup_server ;;
+			2) BAD_OPTION=true ;;
 			3) BAD_OPTION=true ;;
 			4) return ;;
 			*) BAD_OPTION=true ;;
@@ -1315,22 +1316,78 @@ function interactive_setup_cloud_provider() {
 	done
 }
 
-function interactive_setup_server() {
-	echo "interactive_setup_server not implemented yet"
+function interactive_configure_server() {
+	if is_root -eq 0; then
+		return
+	fi
+
+	clear
+
+	echo -e "Mail sender is the mail address that will send notifications\n"
+	read -p "Enter mail sender: [$_MAIL_SENDER]: " MAIL_SENDER
+	MAIL_SENDER=${MAIL_SENDER:-$_MAIL_SENDER}
+	# @TODO: Add verification that the token and mail is correct
+	_MAIL_SENDER=$MAIL_SENDER
+	update_config_file
+
+	clear
+	echo -e "Mail token is the token that's used by gmail to authenticate the user\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	read -p "Enter Mail sender token [$_MAIL_TOKEN]: " MAIL_TOKEN
+	MAIL_TOKEN=${MAIL_TOKEN:-$_MAIL_TOKEN}
+	_MAIL_TOKEN=$MAIL_TOKEN
+	# @TODO: Add verification that the token and mail is correct
+	update_config_file
+
+	clear
+	echo -e "P4 ticket is a ticket that's used to authenticate the SuperUser account that's used to make the backups. Preferably not a expiring ticket\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	read -p "Enter P4 Ticket [$_P4_TICKET]: " P4_TICKET
+	P4_TICKET=${P4_TICKET:-$_P4_TICKET}
+	# @todo: Verify the P4_TICKET
+	_P4_TICKET=$P4_TICKET
+	update_config_file
+
+	clear
+	echo -e "Mail notification recepients is a comma separated list of email adresses that want to receive mail when something goes wrong\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	echo -e "P4 Ticket [$_P4_TICKET]"
+	read -p "Enter Mail notification recepients [$_NOTIFICATION_RECIPIENTS]: " NOTIFICATION_RECIPIENTS
+	NOTIFICATION_RECIPIENTS=${NOTIFICATION_RECIPIENTS:-$_NOTIFICATION_RECIPIENTS}
+	# @todo: Verify the NOTIFICATION_RECIPIENTS
+	_NOTIFICATION_RECIPIENTS=$NOTIFICATION_RECIPIENTS
+	update_config_file
+
+	setup
 }
 
 function interactive(){
 	local BAD_OPTION=false
 
+	local IS_ROOT=true
+	local IS_ROOT_MSG=""
+	if is_root -eq 0; then
+		IS_ROOT_MSG="(require script to be run as root)"
+		IS_ROOT=false
+	fi
+
+	local OPTION=0
 	while true; do
 		clear
 
-		if [[ $BAD_OPTION == true ]]; then
-			echo "Invalid option... Try again"
+		if $BAD_OPTION; then
+			if [ $OPTION -eq 2 ]; then
+				echo "Require root to run setup. Restart script with root access"
+			else
+				echo "Invalid option. Try again..."
+			fi
 		fi
+
 		echo "Select option:"
 		echo "1. Setup cloud provider"
-		echo "2. Setup server (uninplemented)"
+		echo "2. Configure server $IS_ROOT_MSG"
 		echo "3. Restore perforce backup (uninplemented)"
 		echo "4. Make backup (uninplemented)"
 		echo "5. Verify integrity (uninplemented)"
@@ -1339,7 +1396,7 @@ function interactive(){
 		read OPTION
 		case $OPTION in
 			1) BAD_OPTION=false; interactive_setup_cloud_provider; ;;
-			2) BAD_OPTION=true; interactive_setup_server ;;
+			2) BAD_OPTION=$(! $IS_ROOT && echo "true" || echo "false"); interactive_configure_server ;;
 			3) BAD_OPTION=true ;; #restore_db ;;
 			4) BAD_OPTION=true ;; #nightly_backup ;;
 			5) BAD_OPTION=true ;; #weekly_verification ;;
