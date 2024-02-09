@@ -1190,20 +1190,6 @@ function update_config_file() {
 	set_perforce_permissions "$(get_config_file)"
 }
 
-function interactive_print_select_cloud_provider() {
-	local BAD_OPTION="${1:-false}"
-	clear
-
-	if [[ $BAD_OPTION == true ]]; then
-		echo "Invalid option... Try again"
-	fi
-	echo "Select cloud provider:"
-	echo "1. Google Cloud"
-	echo "2. Amazon Web Services (uninplemented)"
-	echo "3. Microsoft Azure (uninplemented)"
-	echo "4. Back"
-}
-
 function interactive_update_glcoud_settings() {
 	local BAD_USER=false
 	while true; do
@@ -1307,12 +1293,21 @@ function interactive_update_glcoud_settings() {
 function interactive_setup_cloud_provider() {
 	local BAD_OPTION=false
 	while true; do
-		interactive_print_select_cloud_provider "$BAD_OPTION"
+		clear
+		if [[ $BAD_OPTION == true ]]; then
+			echo "Invalid option... Try again"
+		fi
+
+		echo "Select cloud provider:"
+		echo "1. Google Cloud"
+		echo "2. Amazon Web Services (uninplemented)"
+		echo "3. Microsoft Azure (uninplemented)"
+		echo "4. Back"
 
 		read OPTION
 		case $OPTION in
 			1) BAD_OPTION=false; interactive_update_glcoud_settings ;;
-			2) BAD_OPTION=true ;;
+			2) BAD_OPTION=true; interactive_setup_server ;;
 			3) BAD_OPTION=true ;;
 			4) return ;;
 			*) BAD_OPTION=true ;;
@@ -1320,32 +1315,31 @@ function interactive_setup_cloud_provider() {
 	done
 }
 
-function print_interactive_menu() {
-	local BAD_OPTION="${1:-false}"
-
-	clear
-
-	if [[ $BAD_OPTION == true ]]; then
-		echo "Invalid option... Try again"
-	fi
-	echo "Select option:"
-	echo "1. Setup cloud provider"
-	echo "2. Setup server (uninplemented)"
-	echo "3. Restore perforce backup (uninplemented)"
-	echo "4. Make backup (uninplemented)"
-	echo "5. Verify integrity (uninplemented)"
-	echo "6. Exit"
+function interactive_setup_server() {
+	echo "interactive_setup_server not implemented yet"
 }
 
 function interactive(){
 	local BAD_OPTION=false
 
 	while true; do
-		print_interactive_menu "$BAD_OPTION"
+		clear
+
+		if [[ $BAD_OPTION == true ]]; then
+			echo "Invalid option... Try again"
+		fi
+		echo "Select option:"
+		echo "1. Setup cloud provider"
+		echo "2. Setup server (uninplemented)"
+		echo "3. Restore perforce backup (uninplemented)"
+		echo "4. Make backup (uninplemented)"
+		echo "5. Verify integrity (uninplemented)"
+		echo "6. Exit"		
+
 		read OPTION
 		case $OPTION in
 			1) BAD_OPTION=false; interactive_setup_cloud_provider; ;;
-			2) BAD_OPTION=true ;; #setup ;;
+			2) BAD_OPTION=true; interactive_setup_server ;;
 			3) BAD_OPTION=true ;; #restore_db ;;
 			4) BAD_OPTION=true ;; #nightly_backup ;;
 			5) BAD_OPTION=true ;; #weekly_verification ;;
