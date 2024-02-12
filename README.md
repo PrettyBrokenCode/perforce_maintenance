@@ -5,8 +5,13 @@ Script for doing the normal maintenance you need to do for perforce
 ## How to setup
 Copy the file to a location on your machine and give it execute permissions
 
-Then run `./perforce_maintenance.sh --gcloud_setup` to setup google cloud backend. It will prompt you for more variables if it needs them
+Then run `./perforce_maintenance.sh -i` to start interactive mode. You need to first setup your cloud provider, then your server by answering all question.
+Right now interactive mode isn't that smart about what parameters is required so ensure that FIRST run Setup Cloud Provider, then Configure Server.
 
-Then run `./perforce_maintenance.sh --setup` to setup the computer to hook up the script with crontab. It will prompt you for more variables if it needs them
+After that you should be good to run backup.
 
-If you want to seed your google cloud directly without letting the script run, then run `./perforce_maintenance.sh --nightly`. It will prompt you for more variables if it needs them
+# NOTE
+This will be rewritten in GO when it's been deployed to first user. As I noticed that it's become way to big for a sane bash-script. So it won't be as throughly tested until the go version is released.
+
+## Why go
+I want the script to have as few dependencies on the installed machine as possible, so all languages requre installation of some kind of runtime would invalidate this condition. This leaves C++ and Go from the google client library list. And I want to learn go, so that's why I have chosen go.
