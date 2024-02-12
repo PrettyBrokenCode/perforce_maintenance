@@ -1175,6 +1175,11 @@ function read_config_file() {
 	_MAIL_TOKEN=`jq -r				'.mail_token' $(get_config_file)`
 	_NOTIFICATION_RECIPIENTS=`jq -r	'.notification_recipients' $(get_config_file)`
 	_P4_TICKET=`jq -r				'.p4_ticket' $(get_config_file)`
+	_P4_ROOT=`jq -r					'.p4_root' $(get_config_file)`
+	_SERVER_NAME=`jq -r				'.server_name' $(get_config_file)`
+	_P4_JOURNAL=`jq -r				'.p4_journal' $(get_config_file)`
+	_P4_CASE=`jq -r					'.p4_case' $(get_config_file)`
+	_P4_ARCHIVES_DIR=`jq -r			'.p4_archives_dir' $(get_config_file)`
 }
 
 function update_config_file() {
@@ -1186,7 +1191,12 @@ function update_config_file() {
 	\\\"mail_sender\\\": \\\"$_MAIL_SENDER\\\",
 	\\\"mail_token\\\": \\\"$_MAIL_TOKEN\\\",
 	\\\"notification_recipients\\\": \\\"$_NOTIFICATION_RECIPIENTS\\\",
-	\\\"p4_ticket\\\": \\\"$_P4_TICKET\\\"
+	\\\"p4_ticket\\\": \\\"$_P4_TICKET\\\",
+	\\\"p4_root\\\": \\\"$_P4_ROOT\\\",
+	\\\"server_name\\\": \\\"$_SERVER_NAME\\\",
+	\\\"p4_journal\\\": \\\"$_P4_JOURNAL\\\",
+	\\\"p4_case\\\": \\\"$_P4_CASE\\\",
+	\\\"p4_archives_dir\\\": \\\"$_P4_ARCHIVES_DIR\\\"
 }\" > $(get_config_file)" "perforce"
 	set_perforce_permissions "$(get_config_file)"
 }
@@ -1363,6 +1373,95 @@ function interactive_configure_server() {
 	setup
 }
 
+function interactive_restore_db_and_files() {
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	read -p "Enter P4ROOT [$_P4_ROOT]: " P4_ROOT
+	P4_ROOT=${P4_ROOT:-$_P4_ROOT}
+	_P4_ROOT=$P4_ROOT
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	read -p "Enter server name [$_SERVER_NAME]: " SERVER_NAME
+	SERVER_NAME=${SERVER_NAME:-$_SERVER_NAME}
+	_SERVER_NAME=$SERVER_NAME
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	read -p "Enter P4JOURNAL [$_P4_JOURNAL]: " P4_JOURNAL
+	P4_JOURNAL=${P4_JOURNAL:-$_P4_JOURNAL}
+	_P4_JOURNAL=$P4_JOURNAL
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	echo -e "P4JOURNAL [$_P4_JOURNAL]"
+	read -p "Enter P4_WINDOWS_CASE [$_P4_CASE]: " P4_CASE
+	P4_CASE=${P4_CASE:-$_P4_CASE}
+	_P4_CASE=$P4_CASE
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	echo -e "P4JOURNAL [$_P4_JOURNAL]"
+	echo -e "P4_WINDOWS_CASE [$_P4_CASE]"
+	read -p "Enter P4_ARCHIVES_DIR [$_P4_ARCHIVES_DIR]: " P4_ARCHIVES_DIR
+	P4_ARCHIVES_DIR=${P4_ARCHIVES_DIR:-$_P4_ARCHIVES_DIR}
+	_P4_ARCHIVES_DIR=$P4_ARCHIVES_DIR
+	update_config_file
+	
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	echo -e "P4JOURNAL [$_P4_JOURNAL]"
+	echo -e "P4_WINDOWS_CASE [$_P4_CASE]"
+	echo -e "P4_ARCHIVES_DIR [$_P4_ARCHIVES_DIR]"
+	read -p "Enter no_fetch_license [$_FETCH_LICENSE]: " FETCH_LICENSE
+	FETCH_LICENSE=${FETCH_LICENSE:-$_FETCH_LICENSE}
+	_FETCH_LICENSE=$FETCH_LICENSE
+	update_config_file
+
+	#--gcloud_bucket=feeblemindstestbackup-3 \
+	#-t 76A9F079C69FB1E444EF5A4F4A9049C6 \
+	#--gcloud_project=ninjagarden-406616 \
+	#--gcloud_backup_user=on-prem-perforce-backup3 \
+	restore_db_and_files
+}
+
+function interactive_restore(){
+	local BAD_OPTION=false
+
+	while true; do
+		clear
+
+		if $BAD_OPTION; then
+			echo "Invalid option... Try again"
+		fi
+		echo "Select restore mode:"
+		echo "1. Restore db (not implemented yet)"
+		echo "2. Restore db and files"
+		echo "3. Back"
+
+		read OPTION
+		case $OPTION in
+			1) BAD_OPTION=true;; #restore_db ;;
+			2) BAD_OPTION=false; interactive_restore_db_and_files ;;
+			3) return ;;
+		esac
+	
+	done
+}
+
 function interactive(){
 	local BAD_OPTION=false
 
@@ -1388,7 +1487,7 @@ function interactive(){
 		echo "Select option:"
 		echo "1. Setup cloud provider"
 		echo "2. Configure server $IS_ROOT_MSG"
-		echo "3. Restore perforce backup (uninplemented)"
+		echo "3. Restore perforce backup"
 		echo "4. Make backup (uninplemented)"
 		echo "5. Verify integrity (uninplemented)"
 		echo "6. Exit"		
@@ -1397,7 +1496,7 @@ function interactive(){
 		case $OPTION in
 			1) BAD_OPTION=false; interactive_setup_cloud_provider; ;;
 			2) BAD_OPTION=$(! $IS_ROOT && echo "true" || echo "false"); interactive_configure_server ;;
-			3) BAD_OPTION=true ;; #restore_db ;;
+			3) BAD_OPTION=false; interactive_restore ;;
 			4) BAD_OPTION=true ;; #nightly_backup ;;
 			5) BAD_OPTION=true ;; #weekly_verification ;;
 			6) exit 0 ;;
