@@ -1462,6 +1462,18 @@ function interactive_restore(){
 	done
 }
 
+function interactive_backup(){
+	nightly_backup
+
+	sleep 3
+}
+
+function interactive_weekly_verification(){
+	weekly_verification
+
+	sleep 3
+}
+
 function interactive(){
 	local BAD_OPTION=false
 
@@ -1479,27 +1491,32 @@ function interactive(){
 		if $BAD_OPTION; then
 			if [ $OPTION -eq 2 ]; then
 				echo "Require root to run setup. Restart script with root access"
-			else
+ 			else
 				echo "Invalid option. Try again..."
 			fi
 		fi
+
+		local VERBOSE_STRING=$([ $_VERBOSE -eq 1 ] && echo "On" || echo "Off")
+		
 
 		echo "Select option:"
 		echo "1. Setup cloud provider"
 		echo "2. Configure server $IS_ROOT_MSG"
 		echo "3. Restore perforce backup"
-		echo "4. Make backup (uninplemented)"
-		echo "5. Verify integrity (uninplemented)"
-		echo "6. Exit"		
+		echo "4. Make backup"
+		echo "5. Verify integrity"
+		echo "6. Toggle verbose mode ($VERBOSE_STRING)"
+		echo "7. Exit"		
 
 		read OPTION
 		case $OPTION in
 			1) BAD_OPTION=false; interactive_setup_cloud_provider; ;;
 			2) BAD_OPTION=$(! $IS_ROOT && echo "true" || echo "false"); interactive_configure_server ;;
 			3) BAD_OPTION=false; interactive_restore ;;
-			4) BAD_OPTION=true ;; #nightly_backup ;;
-			5) BAD_OPTION=true ;; #weekly_verification ;;
-			6) exit 0 ;;
+			4) BAD_OPTION=false; interactive_backup ;;
+			5) BAD_OPTION=false; interactive_weekly_verification ;;
+			6) BAD_OPTION=false; _VERBOSE=$([ $_VERBOSE -eq 1 ] && echo "0" || echo "1") ;;
+			7) exit 0 ;;
 			*) BAD_OPTION=true ;;
 		esac
 	done
