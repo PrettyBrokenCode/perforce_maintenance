@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r: -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license -- "$@")
+TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r:,i -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -23,6 +23,7 @@ _P4_ADAPTER=-1
 _FETCH_LICENSE=true
 _VERBOSE=0
 _NO_REVOKE=0
+_INTERACTIVE=0
 
 _NIGHTLY=0
 _WEEKLY=0
@@ -47,6 +48,7 @@ while true; do
 	case "$1" in
 		-n|--nightly) _NIGHTLY=1; shift ;;
 		-w|--weekly) _WEEKLY=1; shift ;;
+		-i|--interactive) _INTERACTIVE=1; shift ;;
 		--gcloud_setup) _GCLOUD_SETUP=1; shift ;;
 		-v|--verbose) _VERBOSE=1; shift ;;
 		--no_revoke) _NO_REVOKE=1; shift ;;
@@ -154,7 +156,7 @@ while true; do
     esac
 done
 
-if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 ]]; then
+if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 && "$_INTERACTIVE" -ne 0 ]]; then
 	echoerr "Either nightly, weekly, setup, restore or weekly_setup needs to be set for the backupscript to run"
 	echoerr "EXITING!"
 	exit -1
@@ -224,6 +226,10 @@ function send_mail() {
 	fi
 }
 
+function get_config_file() {
+	echo "/opt/perforce/backup/maintenance_conf.json"
+}
+
 function safe_command() {
 	local COMMAND="$1"; shift
 	local PRINT_RESULT=${1:-false}
@@ -257,6 +263,103 @@ function gc_safe_gcloud() {
 	safe_command "gcloud $COMMAND -q" "$PRINT_RESULT"
 }
 
+function gc_create_bucket_if_not_exist() {
+	local BUCKET="$1"; shift
+
+	# check if the bucket exists
+	local GCLOUD_OUTPUT=$(gc_safe_gcloud "storage buckets list --filter=$BUCKET --format=json" true)
+
+	# Bucket doesn't exist, create it
+	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
+		verbose_log "Creating bucket"
+		gc_safe_gcloud "storage buckets create gs://$BUCKET/ \
+		--uniform-bucket-level-access \
+		--default-storage-class=Standard \
+		--location=EUROPE-NORTH1 \
+		--pap \
+		2>&1" true
+	else
+		verbose_log "Skipping creating bucket, as it already exists"
+	fi
+
+	return 0
+}
+
+function gc_login() {
+	local USER="$1"; shift
+	local STRICT=${1:-true}
+
+	# Check if the user is already logged in
+	local GCLOUD_OUTPUT=$(gc_safe_gcloud "auth list --filter-account=$USER --format=json" false)
+
+	# Need to login, so run interactive prompt (don't use gc_safe_gcloud or safe_command)
+	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq "0" ]]; then
+		gcloud auth login $USER
+		if [[ "$?" -ne 0 ]]; then
+			if $STRICT; then
+				force_exit_msg "gc_login failed: Failed to login"
+			else
+				echo "gc_login failed: Failed to login"
+				return 1
+			fi
+		fi
+	else
+		verbose_log "Setting account $USER"
+		# Set the active account
+		gc_safe_gcloud "config set account $USER"
+	fi
+
+	return 0
+}
+
+function gc_create_or_update_backup_role() {
+	local BACKUP_ROLE="$1"; shift
+
+	# The required permission of the backup role
+	local REQUIRED_PERMISSIONS="storage.objects.list,storage.objects.create,storage.objects.delete,storage.objects.get,storage.buckets.get"
+	local ROLE_COMMAND="$BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS --stage=ALPHA"
+
+	# Check if the role exists
+	gcloud iam roles describe $BACKUP_ROLE --project=$_GCLOUD_PROJECT &> /dev/null
+	
+	# If the backup role doesn't exist, create it
+	if [[ "$?" -eq "1" ]]; then
+		verbose_log "Creating backup role with correct permissions"
+		gc_safe_gcloud "iam roles create $ROLE_COMMAND"
+	else
+		verbose_log "Updating backup role with correct permissions"
+		gc_safe_gcloud "iam roles update $ROLE_COMMAND"
+	fi
+}
+
+function gc_create_or_update_backup_user() {
+	local GCLOUD_BACKUP_USER="$1"
+
+	local GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(gc_get_backup_account_mail "$GCLOUD_BACKUP_USER") 2>&1`
+
+	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
+		# User doesn't exist, create it
+		gc_safe_gcloud "iam service-accounts create $GCLOUD_BACKUP_USER --display-name=\"Perforce backup user\"" true
+	else
+		verbose_log	"Skipping creating service account as it already exists"
+	fi
+
+	# Get the roles of the service account to verify that the service account has the correct role
+	GCLOUD_OUTPUT=$(gc_safe_gcloud "projects get-iam-policy $_GCLOUD_PROJECT --flatten='bindings[].members' \
+		--format='table(bindings.role)' \
+		--filter='bindings.members:serviceAccount:$(gc_get_backup_account_mail "$GCLOUD_BACKUP_USER") AND \
+			bindings.role=$(gc_get_backup_role_absolute_path)' --format=json" true)
+
+	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
+		# Add the role to the service account
+		verbose_log "Adding the role $(gc_get_backup_role_absolute_path) to backup user $(gc_get_backup_account_mail "$GCLOUD_BACKUP_USER")"
+		gc_safe_gcloud "projects add-iam-policy-binding $_GCLOUD_PROJECT \
+			--role=$(gc_get_backup_role_absolute_path) \
+			--member=serviceAccount:$(gc_get_backup_account_mail "$GCLOUD_BACKUP_USER")" true
+	else
+		verbose_log "Skipping adding role to backup user, as it already has it"
+	fi
+}
 
 # @return 0 if the file exists, 1 if it doesn't
 function gc_file_exists() {
@@ -287,10 +390,15 @@ function gc_backup_account_cred_file() {
 
 
 function gc_get_backup_account_mail() {
-	require_param "_GCLOUD_BACKUP_USER" "--gcloud_backup_user"
+	local USER=$1
+
+	if [[ "$USER" -eq "-1" || "$USER" == "" ]]; then
+		require_param "_GCLOUD_BACKUP_USER" "--gcloud_backup_user"
+		USER=$_GCLOUD_BACKUP_USER
+	fi
 	require_param "_GCLOUD_PROJECT" "--gcloud_project"
 
-	echo "$_GCLOUD_BACKUP_USER@$_GCLOUD_PROJECT.iam.gserviceaccount.com"
+	echo "$USER@$_GCLOUD_PROJECT.iam.gserviceaccount.com"
 }
 
 
@@ -586,18 +694,7 @@ function gcloud_setup() {
 	# Declare local variable that doesn't change the $?
 	declare -I GCLOUD_OUTPUT
 
-	# Check if the user is already logged in
-	GCLOUD_OUTPUT=$(gc_safe_gcloud "auth list --filter-account=$_GCLOUD_USER --format=json" true)
-
-	# Need to login, so run interactive prompt (don't use gc_safe_gcloud or safe_command)
-	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq "0" ]]; then
-		gcloud auth login $_GCLOUD_USER
-		check_returncode_with_msg "$?" "gcloud_setup failed: Failed to login"
-	else
-		verbose_log "Setting account $_GCLOUD_USER"
-		# Set the active account
-		gc_safe_gcloud "config set account $_GCLOUD_USER" true
-	fi
+	gc_login "$_GCLOUD_USER"
 
 	# Ensure that we are working on the correct project
 	GCLOUD_OUTPUT=$(gc_safe_gcloud "config set project $_GCLOUD_PROJECT" true)
@@ -606,62 +703,9 @@ function gcloud_setup() {
 		force_exit_msg "gcloud_setup failed: You don't have permission or the project $_GCLOUD_PROJECT doesn't exist: Error: \n'$GCLOUD_OUTPUT'"
 	fi
 
-	# check if the bucket exists
-	GCLOUD_OUTPUT=$(gc_safe_gcloud "storage buckets list --filter=$_GCLOUD_BUCKET --format=json" true)
-
-	# Bucket doesn't exist, create it
-	if  [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
-		verbose_log "Creating bucket"
-		gc_safe_gcloud "storage buckets create gs://$_GCLOUD_BUCKET/ \
-		--uniform-bucket-level-access \
-		--default-storage-class=Standard \
-		--location=EUROPE-NORTH1 \
-		--pap \
-		2>&1" true
-	else
-		verbose_log "Skipping creating bucket, as it already exists"
-	fi
-
-	# The required permission of the backup role
-	local REQUIRED_PERMISSIONS="storage.objects.list,storage.objects.create,storage.objects.delete,storage.objects.get,storage.buckets.get"
-	local ROLE_COMMAND="$_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT --permissions=$REQUIRED_PERMISSIONS --stage=ALPHA"
-
-	# Check if the role exists
-	gcloud iam roles describe $_GCLOUD_BACKUP_ROLE --project=$_GCLOUD_PROJECT &> /dev/null
-	
-	# If the backup role doesn't exist, create it
-	if [[ "$?" -eq "1" ]]; then
-		verbose_log "Creating backup role with correct permissions"
-		gc_safe_gcloud "iam roles create $ROLE_COMMAND" true
-	else
-		verbose_log "Updating backup role with correct permissions"
-		gc_safe_gcloud "iam roles update $ROLE_COMMAND" true
-	fi
-
-	GCLOUD_OUTPUT=`gcloud iam service-accounts list --format=json --filter=$(gc_get_backup_account_mail) 2>&1`
-
-	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
-		# User doesn't exist, create it
-		gc_safe_gcloud "iam service-accounts create $_GCLOUD_BACKUP_USER --display-name=\"Perforce backup user\"" true
-	else
-		verbose_log	"Skipping creating service account as it already exists"
-	fi
-
-	# Get the roles of the service account to verify that the service account has the correct role
-	GCLOUD_OUTPUT=$(gc_safe_gcloud "projects get-iam-policy $_GCLOUD_PROJECT --flatten='bindings[].members' \
-		--format='table(bindings.role)' \
-		--filter='bindings.members:serviceAccount:$(gc_get_backup_account_mail) AND \
-			bindings.role=$(gc_get_backup_role_absolute_path)' --format=json" true)
-
-	if [[ $(echo -e "$GCLOUD_OUTPUT" | jq length) -eq 0 ]]; then
-		# Add the role to the service account
-		verbose_log "Adding the role $(gc_get_backup_role_absolute_path) to backup user $(gc_get_backup_account_mail)"
-		gc_safe_gcloud "projects add-iam-policy-binding $_GCLOUD_PROJECT \
-			--role=$(gc_get_backup_role_absolute_path) \
-			--member=serviceAccount:$(gc_get_backup_account_mail)" true
-	else
-		verbose_log "Skipping adding role to backup user, as it already has it"
-	fi
+	gc_create_bucket_if_not_exist "$_GCLOUD_BUCKET"
+	gc_create_or_update_backup_role "$_GCLOUD_BACKUP_ROLE"
+	gc_create_or_update_backup_user "$_GCLOUD_BACKUP_USER"
 
 	if [[ ! -d /opt/perforce ]]; then
 		verbose_log	"Creating /opt/perforce if it doesn't exist"
@@ -702,8 +746,6 @@ function gcloud_setup() {
 		# Revoke our credentials so that they don't stay on the server by accident
 		gc_safe_gcloud "auth revoke $_GCLOUD_USER"
 	fi
-
-	force_exit
 }
 
 function trim_checkpoints() {
@@ -1087,28 +1129,21 @@ FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
 	safe_command "chmod 774 $INSTALLED_PATH"
 	safe_command "chown perforce:perforce $INSTALLED_PATH"
 
-	local PERFORCE_TICKET_FILE=/opt/perforce/backup/perforce_ticket.txt
-
 	# Ensure that there is a /opt/perforce/backup directory with correct permissions
 	if [ ! -d /opt/perforce/backup ]; then
 		mkdir /opt/perforce/backup
 		set_perforce_permissions  "/opt/perforce/backup" "-R"
 	fi
 
-	cat <<EOF > $PERFORCE_TICKET_FILE
-$_P4_TICKET
-EOF
-	set_perforce_permissions "$PERFORCE_TICKET_FILE"
-
 	local MAINTENENCE_USER="perforce"
 
 	# For explaination on crontab, see https://crontab.guru/#02_1_*_*_1-5,0
 	local NIGHTLY_MAINTENENCE_TIME="2 1 * * 1-5,0"
-	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --gcloud_project=$_GCLOUD_PROJECT --gcloud_bucket=$_GCLOUD_BUCKET --gcloud_backup_user=$_GCLOUD_BACKUP_USER -t \`cat $PERFORCE_TICKET_FILE\` -m $_NOTIFICATION_RECIPIENTS"
+	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly"
 	
 	# For explaination on crontab, see https://crontab.guru/#2_1_*_*_6
 	local WEEKLY_MAINTENENCE_TIME="2 1 * * 6"
-	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly --gcloud_project=$_GCLOUD_PROJECT --gcloud_bucket=$_GCLOUD_BUCKET --gcloud_backup_user=$_GCLOUD_BACKUP_USER -t \`cat $PERFORCE_TICKET_FILE\` -m $_NOTIFICATION_RECIPIENTS"
+	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly"
 
 	# MAILTO="" is to disable mail sending, as we are using ssmtp in the script to send mail
 	echo 'MAILTO=""' > "/etc/cron.d/perforce_maintenance"
@@ -1121,6 +1156,379 @@ EOF
 
 	verbose_log "Setup is complete"
 }
+
+function read_config_file() {
+	# Read the config file
+
+	if [[ ! -f $(get_config_file) ]]; then
+		# If the config doesn't exist, then we create it with the values that has been passed in (or default values)
+		update_config_file
+		set_perforce_permissions "$(get_config_file)"
+	fi
+
+	# Read the config file
+	_GCLOUD_PROJECT=`jq -r			'.project_id' $(get_config_file)`
+	_GCLOUD_BUCKET=`jq -r			'.bucket' $(get_config_file)`
+	_GCLOUD_BACKUP_USER=`jq -r		'.backup_user' $(get_config_file)`
+	_GCLOUD_BACKUP_ROLE=`jq -r		'.backup_role' $(get_config_file)`
+	_MAIL_SENDER=`jq -r				'.mail_sender' $(get_config_file)`
+	_MAIL_TOKEN=`jq -r				'.mail_token' $(get_config_file)`
+	_NOTIFICATION_RECIPIENTS=`jq -r	'.notification_recipients' $(get_config_file)`
+	_P4_TICKET=`jq -r				'.p4_ticket' $(get_config_file)`
+	_P4_ROOT=`jq -r					'.p4_root' $(get_config_file)`
+	_SERVER_NAME=`jq -r				'.server_name' $(get_config_file)`
+	_P4_JOURNAL=`jq -r				'.p4_journal' $(get_config_file)`
+	_P4_CASE=`jq -r					'.p4_case' $(get_config_file)`
+	_P4_ARCHIVES_DIR=`jq -r			'.p4_archives_dir' $(get_config_file)`
+}
+
+function update_config_file() {
+	run_as "echo -e \"{
+	\\\"project_id\\\": \\\"$_GCLOUD_PROJECT\\\",
+	\\\"bucket\\\": \\\"$_GCLOUD_BUCKET\\\",
+	\\\"backup_user\\\": \\\"$_GCLOUD_BACKUP_USER\\\",
+	\\\"backup_role\\\": \\\"$_GCLOUD_BACKUP_ROLE\\\",
+	\\\"mail_sender\\\": \\\"$_MAIL_SENDER\\\",
+	\\\"mail_token\\\": \\\"$_MAIL_TOKEN\\\",
+	\\\"notification_recipients\\\": \\\"$_NOTIFICATION_RECIPIENTS\\\",
+	\\\"p4_ticket\\\": \\\"$_P4_TICKET\\\",
+	\\\"p4_root\\\": \\\"$_P4_ROOT\\\",
+	\\\"server_name\\\": \\\"$_SERVER_NAME\\\",
+	\\\"p4_journal\\\": \\\"$_P4_JOURNAL\\\",
+	\\\"p4_case\\\": \\\"$_P4_CASE\\\",
+	\\\"p4_archives_dir\\\": \\\"$_P4_ARCHIVES_DIR\\\"
+}\" > $(get_config_file)" "perforce"
+	set_perforce_permissions "$(get_config_file)"
+}
+
+function interactive_update_glcoud_settings() {
+	local BAD_USER=false
+	while true; do
+		clear
+		if $BAD_USER; then
+			echo "Failed to login with user [$GCLOUD_USER], try another user..."
+		fi
+
+		local GCLOUD_OUTPUT=$(gc_safe_gcloud "auth list --format=json" true)
+		_GCLOUD_USER=$(echo -e "$GCLOUD_OUTPUT" | jq -r '.[] | select(.status=="ACTIVE") | .account')
+
+		read -p "Enter user to setup the google cloud intergration with [$_GCLOUD_USER] : " GCLOUD_USER
+		GCLOUD_USER=${GCLOUD_USER:-$_GCLOUD_USER}
+
+		if gc_login "$GCLOUD_USER" -eq 0; then
+			_GCLOUD_USER=$GCLOUD_USER
+			break
+		fi
+		BAD_USER=true
+	done
+	BAD_USER=false
+
+	local BAD_PROJECT=false
+	while true; do
+		clear
+		if $BAD_PROJECT; then
+			echo -e "You don't have permission or the project [$GCLOUD_PROJECT] doesn't exist: Error: \n'$GCLOUD_OUTPUT'"
+		fi
+		echo "Administrator user [$_GCLOUD_USER]"
+
+		read -p "Enter Project id [$_GCLOUD_PROJECT]: " GCLOUD_PROJECT
+		GCLOUD_PROJECT=${GCLOUD_PROJECT:-$_GCLOUD_PROJECT}
+
+		# Ensure that we have permission to the specified project
+		GCLOUD_OUTPUT=$(gc_safe_gcloud "config set project $GCLOUD_PROJECT" true)
+
+		if [[ "$GCLOUD_OUTPUT" == *"WARNING: You do not appear to have access to project [$GCLOUD_PROJECT] or it does not exist."* ]]; then
+			BAD_PROJECT=true
+		else
+			_GCLOUD_PROJECT=$GCLOUD_PROJECT
+			break
+		fi
+	done
+	update_config_file
+
+	clear
+	echo "Administrator user [$_GCLOUD_USER]"
+	echo "Project id [$_GCLOUD_PROJECT]"
+
+	read -p "Enter Bucket id [$_GCLOUD_BUCKET]: " GCLOUD_BUCKET
+	GCLOUD_BUCKET=${GCLOUD_BUCKET:-$_GCLOUD_BUCKET}
+
+	gc_create_bucket_if_not_exist "$GCLOUD_BUCKET"
+	_GCLOUD_BUCKET=$GCLOUD_BUCKET
+	update_config_file
+
+	clear
+	echo "Administrator user [$_GCLOUD_USER]"
+	echo "Project id [$_GCLOUD_PROJECT]"
+	echo "Bucket id [$_GCLOUD_BUCKET]"
+
+	read -p "Enter Backup role [$_GCLOUD_BACKUP_ROLE]: " GCLOUD_BACKUP_ROLE
+	GCLOUD_BACKUP_ROLE=${GCLOUD_BACKUP_ROLE:-$_GCLOUD_BACKUP_ROLE}
+	gc_create_or_update_backup_role "$GCLOUD_BACKUP_ROLE"
+	_GCLOUD_BACKUP_ROLE=$GCLOUD_BACKUP_ROLE
+	update_config_file
+
+	clear
+	echo "Administrator user [$_GCLOUD_USER]"
+	echo "Project id [$_GCLOUD_PROJECT]"
+	echo "Bucket name [$_GCLOUD_BUCKET]"
+	echo "Backup role [$_GCLOUD_BACKUP_ROLE]"
+
+	read -p "Enter Backup user [$_GCLOUD_BACKUP_USER] (not full mail): " GCLOUD_BACKUP_USER
+	# Validate input, åäö will cause the script to fail...
+	GCLOUD_BACKUP_USER=${GCLOUD_BACKUP_USER:-$_GCLOUD_BACKUP_USER}
+	gc_create_or_update_backup_user "$GCLOUD_BACKUP_USER"
+	_GCLOUD_BACKUP_USER=$GCLOUD_BACKUP_USER
+	update_config_file
+
+	clear
+	echo "Administrator user [$_GCLOUD_USER]"
+	echo "Project id [$_GCLOUD_PROJECT]"
+	echo "Bucket name [$_GCLOUD_BUCKET]"
+	echo "Backup role [$_GCLOUD_BACKUP_ROLE]"
+	echo "Backup user [$_GCLOUD_BACKUP_USER]"
+
+	ask_yes_no_question "Do you want to complete the setup with these settings?"
+	# If user made some bad changes, then he/she will be asked to try again
+	if [[ $? -eq 0 ]]; then
+		interactive_update_glcoud_settings
+		return
+	fi
+
+	gcloud_setup
+
+	echo "Setup of cloud provider complete"
+	sleep 2
+}
+
+function interactive_setup_cloud_provider() {
+	local BAD_OPTION=false
+	while true; do
+		clear
+		if [[ $BAD_OPTION == true ]]; then
+			echo "Invalid option... Try again"
+		fi
+
+		echo "Select cloud provider:"
+		echo "1. Google Cloud"
+		echo "2. Amazon Web Services (uninplemented)"
+		echo "3. Microsoft Azure (uninplemented)"
+		echo "4. Back"
+
+		read OPTION
+		case $OPTION in
+			1) BAD_OPTION=false; interactive_update_glcoud_settings ;;
+			2) BAD_OPTION=true ;;
+			3) BAD_OPTION=true ;;
+			4) return ;;
+			*) BAD_OPTION=true ;;
+		esac
+	done
+}
+
+function interactive_configure_server() {
+	if is_root -eq 0; then
+		return
+	fi
+
+	clear
+
+	echo -e "Mail sender is the mail address that will send notifications\n"
+	read -p "Enter mail sender: [$_MAIL_SENDER]: " MAIL_SENDER
+	MAIL_SENDER=${MAIL_SENDER:-$_MAIL_SENDER}
+	# @TODO: Add verification that the token and mail is correct
+	_MAIL_SENDER=$MAIL_SENDER
+	update_config_file
+
+	clear
+	echo -e "Mail token is the token that's used by gmail to authenticate the user\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	read -p "Enter Mail sender token [$_MAIL_TOKEN]: " MAIL_TOKEN
+	MAIL_TOKEN=${MAIL_TOKEN:-$_MAIL_TOKEN}
+	_MAIL_TOKEN=$MAIL_TOKEN
+	# @TODO: Add verification that the token and mail is correct
+	update_config_file
+
+	clear
+	echo -e "P4 ticket is a ticket that's used to authenticate the SuperUser account that's used to make the backups. Preferably not a expiring ticket\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	read -p "Enter P4 Ticket [$_P4_TICKET]: " P4_TICKET
+	P4_TICKET=${P4_TICKET:-$_P4_TICKET}
+	# @todo: Verify the P4_TICKET
+	_P4_TICKET=$P4_TICKET
+	update_config_file
+
+	clear
+	echo -e "Mail notification recepients is a comma separated list of email adresses that want to receive mail when something goes wrong\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	echo -e "P4 Ticket [$_P4_TICKET]"
+	read -p "Enter Mail notification recepients [$_NOTIFICATION_RECIPIENTS]: " NOTIFICATION_RECIPIENTS
+	NOTIFICATION_RECIPIENTS=${NOTIFICATION_RECIPIENTS:-$_NOTIFICATION_RECIPIENTS}
+	# @todo: Verify the NOTIFICATION_RECIPIENTS
+	_NOTIFICATION_RECIPIENTS=$NOTIFICATION_RECIPIENTS
+	update_config_file
+
+	setup
+}
+
+function interactive_restore_db_and_files() {
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	read -p "Enter P4ROOT [$_P4_ROOT]: " P4_ROOT
+	P4_ROOT=${P4_ROOT:-$_P4_ROOT}
+	_P4_ROOT=$P4_ROOT
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	read -p "Enter server name [$_SERVER_NAME]: " SERVER_NAME
+	SERVER_NAME=${SERVER_NAME:-$_SERVER_NAME}
+	_SERVER_NAME=$SERVER_NAME
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	read -p "Enter P4JOURNAL [$_P4_JOURNAL]: " P4_JOURNAL
+	P4_JOURNAL=${P4_JOURNAL:-$_P4_JOURNAL}
+	_P4_JOURNAL=$P4_JOURNAL
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	echo -e "P4JOURNAL [$_P4_JOURNAL]"
+	read -p "Enter P4_WINDOWS_CASE [$_P4_CASE]: " P4_CASE
+	P4_CASE=${P4_CASE:-$_P4_CASE}
+	_P4_CASE=$P4_CASE
+	update_config_file
+
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	echo -e "P4JOURNAL [$_P4_JOURNAL]"
+	echo -e "P4_WINDOWS_CASE [$_P4_CASE]"
+	read -p "Enter P4_ARCHIVES_DIR [$_P4_ARCHIVES_DIR]: " P4_ARCHIVES_DIR
+	P4_ARCHIVES_DIR=${P4_ARCHIVES_DIR:-$_P4_ARCHIVES_DIR}
+	_P4_ARCHIVES_DIR=$P4_ARCHIVES_DIR
+	update_config_file
+	
+	clear
+	echo -e "P4 ROOT is the root of the P4 installation\n"
+	echo -e "P4ROOT [$_P4_ROOT]"
+	echo -e "Server name [$_SERVER_NAME]"
+	echo -e "P4JOURNAL [$_P4_JOURNAL]"
+	echo -e "P4_WINDOWS_CASE [$_P4_CASE]"
+	echo -e "P4_ARCHIVES_DIR [$_P4_ARCHIVES_DIR]"
+	read -p "Enter no_fetch_license [$_FETCH_LICENSE]: " FETCH_LICENSE
+	FETCH_LICENSE=${FETCH_LICENSE:-$_FETCH_LICENSE}
+	_FETCH_LICENSE=$FETCH_LICENSE
+	update_config_file
+
+	#--gcloud_bucket=feeblemindstestbackup-3 \
+	#-t 76A9F079C69FB1E444EF5A4F4A9049C6 \
+	#--gcloud_project=ninjagarden-406616 \
+	#--gcloud_backup_user=on-prem-perforce-backup3 \
+	restore_db_and_files
+}
+
+function interactive_restore(){
+	local BAD_OPTION=false
+
+	while true; do
+		clear
+
+		if $BAD_OPTION; then
+			echo "Invalid option... Try again"
+		fi
+		echo "Select restore mode:"
+		echo "1. Restore db (not implemented yet)"
+		echo "2. Restore db and files"
+		echo "3. Back"
+
+		read OPTION
+		case $OPTION in
+			1) BAD_OPTION=true;; #restore_db ;;
+			2) BAD_OPTION=false; interactive_restore_db_and_files ;;
+			3) return ;;
+		esac
+	
+	done
+}
+
+function interactive_backup(){
+	nightly_backup
+
+	sleep 3
+}
+
+function interactive_weekly_verification(){
+	weekly_verification
+
+	sleep 3
+}
+
+function interactive(){
+	local BAD_OPTION=false
+
+	local IS_ROOT=true
+	local IS_ROOT_MSG=""
+	if is_root -eq 0; then
+		IS_ROOT_MSG="(require script to be run as root)"
+		IS_ROOT=false
+	fi
+
+	local OPTION=0
+	while true; do
+		clear
+
+		if $BAD_OPTION; then
+			if [ $OPTION -eq 2 ]; then
+				echo "Require root to run setup. Restart script with root access"
+ 			else
+				echo "Invalid option. Try again..."
+			fi
+		fi
+
+		local VERBOSE_STRING=$([ $_VERBOSE -eq 1 ] && echo "On" || echo "Off")
+		
+
+		echo "Select option:"
+		echo "1. Setup cloud provider"
+		echo "2. Configure server $IS_ROOT_MSG"
+		echo "3. Restore perforce backup"
+		echo "4. Make backup"
+		echo "5. Verify integrity"
+		echo "6. Toggle verbose mode ($VERBOSE_STRING)"
+		echo "7. Exit"		
+
+		read OPTION
+		case $OPTION in
+			1) BAD_OPTION=false; interactive_setup_cloud_provider; ;;
+			2) BAD_OPTION=$(! $IS_ROOT && echo "true" || echo "false"); interactive_configure_server ;;
+			3) BAD_OPTION=false; interactive_restore ;;
+			4) BAD_OPTION=false; interactive_backup ;;
+			5) BAD_OPTION=false; interactive_weekly_verification ;;
+			6) BAD_OPTION=false; _VERBOSE=$([ $_VERBOSE -eq 1 ] && echo "0" || echo "1") ;;
+			7) exit 0 ;;
+			*) BAD_OPTION=true ;;
+		esac
+	done
+}
+
+## Here the script starts
+read_config_file
+
+
+if [[ "$_INTERACTIVE" -eq 1 ]]; then
+	interactive
+fi
 
 if [[ "$_SETUP" -eq 1 ]]; then
 	setup
