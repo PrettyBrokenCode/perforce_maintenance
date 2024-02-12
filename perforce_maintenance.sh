@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r:,i -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
+TEMP=$(getopt -o v,m:,b,t:,s,u:,r:,i -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,backup,verify,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -25,8 +25,8 @@ _VERBOSE=0
 _NO_REVOKE=0
 _INTERACTIVE=0
 
-_NIGHTLY=0
-_WEEKLY=0
+_BACKUP=0
+_VERIFY=0
 _SETUP=0
 _RESTORE=0
 
@@ -46,8 +46,8 @@ _GCLOUD_BACKUP_USER=-1
 
 while true; do
 	case "$1" in
-		-n|--nightly) _NIGHTLY=1; shift ;;
-		-w|--weekly) _WEEKLY=1; shift ;;
+		-b|--backup) _BACKUP=1; shift ;;
+		--verify) _VERIFY=1; shift ;;
 		-i|--interactive) _INTERACTIVE=1; shift ;;
 		--gcloud_setup) _GCLOUD_SETUP=1; shift ;;
 		-v|--verbose) _VERBOSE=1; shift ;;
@@ -156,8 +156,8 @@ while true; do
     esac
 done
 
-if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 && "$_INTERACTIVE" -ne 0 ]]; then
-	echoerr "Either nightly, weekly, setup, restore or weekly_setup needs to be set for the backupscript to run"
+if [[ "$_BACKUP" -eq 0 && "$_VERIFY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 && "$_INTERACTIVE" -ne 0 ]]; then
+	echoerr "Either backup, verify, setup, restore or interactive needs to be set for the maintinence script to run"
 	echoerr "EXITING!"
 	exit -1
 fi
@@ -628,9 +628,14 @@ function ask_yes_no_question() {
 }
 
 function show_var() {
-	local VARNAME=$1
+	local VARNAME=$1; shift
+	local VERBOSE=${1:-false}
 
-	echo -e "$VARNAME='${!VARNAME}'"
+	if $VERBOSE; then
+		verbose_log "$VARNAME='${!VARNAME}'"
+	else
+		echo -e "$VARNAME='${!VARNAME}'"
+	fi
 }
 
 function from_func() {
@@ -789,7 +794,7 @@ function wait_for_permission_propagation() {
 	wait_for_permission "storage buckets describe gs://$_GCLOUD_BUCKET" "Bucket permissions"
 }
 
-function nightly_backup() {
+function backup() {
 	# Reference: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-procedure.html
 	require_param "_GCLOUD_PROJECT" "--gcloud_project"
 	require_param "_GCLOUD_BUCKET" "--gcloud_bucket"
@@ -867,7 +872,7 @@ function nightly_backup() {
 	verbose_log "Nightly backup succeeded"
 }
 
-function weekly_verification() {
+function verify() {
 	require_param "_P4_TICKET" "-t|--p4_ticket"
 
 	# 1. Verify archive files
@@ -875,7 +880,7 @@ function weekly_verification() {
 	# 2. Verify shelved files 
 	p4_run "verify -q -S //..."
 
-	verbose_log "Weekly verification succeeded"
+	verbose_log "Verification succeeded"
 }
 
 # To delete the DB-files to test it, use the following command
@@ -1139,16 +1144,16 @@ FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
 
 	# For explaination on crontab, see https://crontab.guru/#02_1_*_*_1-5,0
 	local NIGHTLY_MAINTENENCE_TIME="2 1 * * 1-5,0"
-	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly"
+	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --backup"
 	
 	# For explaination on crontab, see https://crontab.guru/#2_1_*_*_6
-	local WEEKLY_MAINTENENCE_TIME="2 1 * * 6"
-	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly"
+	local VERIFICATION_TIME="2 1 * * 6"
+	local VERIFICATION_COMMAND="$INSTALLED_PATH --backup --verify"
 
 	# MAILTO="" is to disable mail sending, as we are using ssmtp in the script to send mail
 	echo 'MAILTO=""' > "/etc/cron.d/perforce_maintenance"
 	echo "$NIGHTLY_MAINTENENCE_TIME $MAINTENENCE_USER $NIGHTLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
-	echo "$WEEKLY_MAINTENENCE_TIME $MAINTENENCE_USER $WEEKLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
+	echo "$VERIFICATION_TIME $MAINTENENCE_USER $VERIFICATION_COMMAND" >> "/etc/cron.d/perforce_maintenance"
 
 	safe_command "chmod 640 /etc/cron.d/perforce_maintenance"
 
@@ -1180,6 +1185,19 @@ function read_config_file() {
 	_P4_JOURNAL=`jq -r				'.p4_journal' $(get_config_file)`
 	_P4_CASE=`jq -r					'.p4_case' $(get_config_file)`
 	_P4_ARCHIVES_DIR=`jq -r			'.p4_archives_dir' $(get_config_file)`
+
+	show_var	"_GCLOUD_PROJECT" true
+	show_var	"_GCLOUD_BUCKET" true
+	show_var	"_GCLOUD_BACKUP_USER" true
+	show_var	"_GCLOUD_BACKUP_ROLE" true
+	show_var	"_MAIL_SENDER" true
+	show_var	"_NOTIFICATION_RECIPIENTS" true
+	show_var	"_P4_ROOT" true
+	show_var	"_SERVER_NAME" true
+	show_var	"_P4_JOURNAL" true
+	show_var	"_P4_CASE" true
+	show_var	"_P4_ARCHIVES_DIR" true
+	show_var	"_NO_REVOKE" true
 }
 
 function update_config_file() {
@@ -1463,13 +1481,13 @@ function interactive_restore(){
 }
 
 function interactive_backup(){
-	nightly_backup
+	backup
 
 	sleep 3
 }
 
-function interactive_weekly_verification(){
-	weekly_verification
+function interactive_verification(){
+	verify
 
 	sleep 3
 }
@@ -1514,7 +1532,7 @@ function interactive(){
 			2) BAD_OPTION=$(! $IS_ROOT && echo "true" || echo "false"); interactive_configure_server ;;
 			3) BAD_OPTION=false; interactive_restore ;;
 			4) BAD_OPTION=false; interactive_backup ;;
-			5) BAD_OPTION=false; interactive_weekly_verification ;;
+			5) BAD_OPTION=false; interactive_verification ;;
 			6) BAD_OPTION=false; _VERBOSE=$([ $_VERBOSE -eq 1 ] && echo "0" || echo "1") ;;
 			7) exit 0 ;;
 			*) BAD_OPTION=true ;;
@@ -1546,10 +1564,10 @@ case "$_RESTORE" in
 		restore_db_and_files ;;
 esac
 
-if [[ "$_WEEKLY" -eq 1 ]]; then
-	weekly_verification
+if [[ "$_VERIFY" -eq 1 ]]; then
+	verify
 fi
 
-if [[ "$_NIGHTLY" -eq 1 ]]; then
-	nightly_backup
+if [[ "$_BACKUP" -eq 1 ]]; then
+	backup
 fi
