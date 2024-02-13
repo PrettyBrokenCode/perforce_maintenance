@@ -1,4 +1,4 @@
-# perforce_maintinence
+# perforce_maintenance
 
 Script for doing the normal maintenance you need to do for perforce
 
