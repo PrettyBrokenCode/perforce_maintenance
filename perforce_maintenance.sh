@@ -121,7 +121,7 @@ function force_exit_msg() {
 }
 
 function get_config_file() {
-	echo "/opt/perforce/backup/maintenance_conf.json"
+	echo "/opt/perforce/maintenance/conf.json"
 }
 
 function check_returncode_with_msg() {
@@ -201,6 +201,10 @@ function read_config_file() {
 
 	if [[ ! -f $(get_config_file) ]]; then
 		# If the config doesn't exist, then we create it with the values that has been passed in (or default values)
+		# Also, ensure that the path to the config exists so it can be created
+		if [[ ! -d $(dirname $(get_config_file)) ]]; then
+			safe_command "mkdir -p $(dirname $(get_config_file))"
+		fi
 		update_config_file
 		set_perforce_permissions "$(get_config_file)"
 	fi
@@ -569,7 +573,7 @@ function gc_get_backup_role_absolute_path() {
 }
 
 function gc_backup_account_cred_file() {
-	echo "/opt/perforce/backup/gs_backup_user_key.json"
+	echo "/opt/perforce/maintenance/gs_backup_user_key.json"
 }
 
 
@@ -1026,7 +1030,7 @@ function backup() {
 		gc_safe_gcloud "auth revoke $_GCLOUD_USER"
 	fi
 
-	verbose_log "Nightly backup succeeded"
+	verbose_log "Backup succeeded"
 }
 
 function verify() {
@@ -1271,22 +1275,27 @@ FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
 	safe_command "chmod 774 $INSTALLED_PATH"
 	safe_command "chown perforce:perforce $INSTALLED_PATH"
 
-	# Ensure that there is a /opt/perforce/backup directory with correct permissions
-	if [ ! -d /opt/perforce/backup ]; then
-		mkdir /opt/perforce/backup
-		set_perforce_permissions  "/opt/perforce/backup" "-R"
+	if [[ -d /opt/perforce/backup ]]; then
+		verbose_log "Removing old backup directory..."
+		safe_command "rm -rf /opt/perforce/backup"
+	fi
+
+	# Ensure that there is a /opt/perforce/maintenance directory with correct permissions
+	if [ ! -d /opt/perforce/maintenance ]; then
+		mkdir /opt/perforce/maintenance
+		set_perforce_permissions  "/opt/perforce/maintenance" "-R"
 	fi
 
 	# MAILTO="" is to disable mail sending, as we are using ssmtp in the script to send mail
 	echo 'MAILTO=""' > "/etc/cron.d/perforce_maintenance"
-	if $_MAINTENANCE_WANT_BACKUP; then
+	if [ $_MAINTENANCE_WANT_BACKUP -eq 1 ]; then
 		echo "$_MAINTENANCE_BACKUP_TIME $_MAINTENENCE_USER $INSTALLED_PATH --backup" >> "/etc/cron.d/perforce_maintenance"
 	fi
-	if $_MAINTENANCE_WANT_VERIFY; then
+	if [ $_MAINTENANCE_WANT_VERIFY -eq 1 ]; then
 		echo "$_MAINTENANCE_VERIFY_TIME $_MAINTENENCE_USER $INSTALLED_PATH --verify" >> "/etc/cron.d/perforce_maintenance"
 	fi
-	if $_MAINTENANCE_WANT_BACKUP_AND_VERIFY; then
-		echo "$_MAINTENANCE_BACKUP_AND_VERIFY_TIME $_MAINTENENCE_USER $INSTALLED_PATH --backup -- verify" >> "/etc/cron.d/perforce_maintenance"
+	if [ $_MAINTENANCE_WANT_BACKUP_AND_VERIFY -eq 1 ]; then
+		echo "$_MAINTENANCE_BACKUP_AND_VERIFY_TIME $_MAINTENENCE_USER $INSTALLED_PATH --backup --verify" >> "/etc/cron.d/perforce_maintenance"
 	fi
 
 	safe_command "chmod 640 /etc/cron.d/perforce_maintenance"
@@ -1472,9 +1481,7 @@ function interactive_configure_server() {
 	echo -e "Mail sender token [$_MAIL_TOKEN]"
 	echo -e "P4 Ticket [$_P4_TICKET]"
 	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
-	echo -e "Backup (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP/$_MAINTENANCE_BACKUP_TIME]"
-	echo -e "Verification (Enabled/Cron Notation) [$_MAINTENANCE_WANT_VERIFY/$_MAINTENANCE_VERIFY_TIME]"
-	ask_yes_no_question "Do you want to enable sequential backup and verication of perforce server?"
+	ask_yes_no_question "Do you want to enable sceduled backup and verication of perforce server?"
 	_MAINTENANCE_WANT_BACKUP_AND_VERIFY=$?
 	if [[ $_MAINTENANCE_WANT_BACKUP_AND_VERIFY -eq 1 ]]; then
 		read -p "Enter cron notation for when you want to run verification and then backup [$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]: " MAINTENANCE_BACKUP_AND_VERIFY_TIME
@@ -1491,7 +1498,8 @@ function interactive_configure_server() {
 	echo -e "Mail sender token [$_MAIL_TOKEN]"
 	echo -e "P4 Ticket [$_P4_TICKET]"
 	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
-	ask_yes_no_question "Do you want to enable backup?"
+	echo -e "Backup and verification (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP_AND_VERIFY/$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]"
+	ask_yes_no_question "Do you want to enable scheduled backup?"
 	_MAINTENANCE_WANT_BACKUP=$?
 	if [[ $_MAINTENANCE_WANT_BACKUP -eq 1 ]]; then
 		read -p "Enter cron notation for when you want backup [$_MAINTENANCE_BACKUP_TIME]: " MAINTENANCE_BACKUP_TIME
@@ -1508,8 +1516,9 @@ function interactive_configure_server() {
 	echo -e "Mail sender token [$_MAIL_TOKEN]"
 	echo -e "P4 Ticket [$_P4_TICKET]"
 	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
+	echo -e "Backup and verification (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP_AND_VERIFY/$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]"
 	echo -e "Backup (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP/$_MAINTENANCE_BACKUP_TIME]"
-	ask_yes_no_question "Do you want to enable verication of perforce server?"
+	ask_yes_no_question "Do you want to scheduled enable verication of perforce server?"
 	_MAINTENANCE_WANT_VERIFY=$?
 	if [[ $_MAINTENANCE_WANT_VERIFY -eq 1 ]]; then
 		read -p "Enter cron notation for when you want to run verification [$_MAINTENANCE_VERIFY_TIME]: " MAINTENANCE_VERIFY_TIME
