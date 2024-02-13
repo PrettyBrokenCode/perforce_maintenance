@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m:,n,w,t:,s,u:,r:,i -l p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,nightly,weekly,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
+TEMP=$(getopt -o v,m:,b,t:,s,u:,r:,i -l want_backup:,want_verify:,want_backup_and_verify:,backup_time:,verify_time:,backup_and_verify_time:,p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,backup,verify,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -25,13 +25,23 @@ _VERBOSE=0
 _NO_REVOKE=0
 _INTERACTIVE=0
 
-_NIGHTLY=0
-_WEEKLY=0
+_BACKUP=0
+_VERIFY=0
 _SETUP=0
 _RESTORE=0
 
 _MAINTENENCE_CHECKPOINT_MIN_NUM=14
 _MAINTENENCE_CHECKPOINT_MAX_AGE_IN_DAYS=31
+_MAINTENANCE_WANT_BACKUP=1
+_MAINTENANCE_WANT_VERIFY=0
+_MAINTENANCE_WANT_BACKUP_AND_VERIFY=1
+# For explaination on crontab, see https://crontab.guru/#02_1_*_*_1-5,0
+_MAINTENANCE_BACKUP_TIME="2 1 * * 1-5,0"
+# For explaination on crontab, see https://crontab.guru/#2_1_*_*_6
+_MAINTENANCE_VERIFY_TIME="2 1 * * 6"
+# For explaination on crontab, see https://crontab.guru/#2_1_*_*_6
+_MAINTENANCE_BACKUP_AND_VERIFY_TIME="2 1 * * 6"
+_MAINTENENCE_USER="perforce"
 
 _MAIL_SENDER=-1
 _MAIL_TOKEN=-1
@@ -44,10 +54,220 @@ _GCLOUD_PROJECT=-1
 _GCLOUD_BACKUP_ROLE=CloudBackupRole
 _GCLOUD_BACKUP_USER=-1
 
+
+# Ensure that we can quit in the middle of a function by running exit 1 if we catches the TERM signal
+trap "exit 1" TERM
+export TOP_PID=$$
+
+# Helper function to make it easier to read when we are force quitting the script
+function force_exit() {
+	# Send the TERM signal
+	kill -s TERM $TOP_PID
+}
+
+# from https://stackoverflow.com/a/62757929
+function callstack() { 
+	local i=${1:-1}; shift
+	local max_depth=${1:--1}; shift
+	local line file func skip_first
+
+	while read -r line func file < <(caller $i); do
+		if [[ "$max_depth" -ne "-1" && "$i" -ge "$max_depth" ]]; then
+			break
+		fi
+
+		echo "[$i] $file:$line $func(): $(sed -n ${line}p $file)"
+
+		((i++))
+	done
+}
+
+function verbose_log() {
+	local MESSAGE="$1"
+	if [[ "$_VERBOSE" -ne 0 ]]; then
+		echo -e "$MESSAGE"
+	fi
+}
+
+function show_var() {
+	local VARNAME=$1; shift
+	local VERBOSE=${1:-false}
+
+	if $VERBOSE; then
+		verbose_log "$VARNAME='${!VARNAME}'"
+	else
+		echo -e "$VARNAME='${!VARNAME}'"
+	fi
+}
+
+function send_mail() {
+	local MESSAGE="$1"
+
+	# Verify that we have specified the notification recipient
+	if [[ "$_NOTIFICATION_RECIPIENTS" != -1 ]]; then
+		echo -e "From: Perforce Server\nSubject: Perforce server backup failed\n\n$MESSAGE" | ssmtp $_NOTIFICATION_RECIPIENTS
+	else
+		verbose_log "No notification recipient specified, no mail sent"
+	fi
+}
+
+function force_exit_msg() {
+	local MESSAGE="$1"
+
+	echoerr "$MESSAGE"
+	send_mail "$MESSAGE"
+
+	force_exit
+}
+
+function get_config_file() {
+	echo "/opt/perforce/backup/maintenance_conf.json"
+}
+
+function check_returncode_with_msg() {
+	local RETURN_CODE=$1
+	local ERROR_MESSAGE="$2"
+
+	if [[ "$RETURN_CODE" -ne 0 ]]; then
+		force_exit_msg "$ERROR_MESSAGE"
+	fi
+}
+
+function run_as() {
+	local COMMAND="$1"; shift
+	local USER="$1"; shift
+	local PRINT_RESULT=${1:-false}
+
+	local USER_SWITCH_COMMAND=""
+	if [[ "$(whoami)" != "$USER" ]]; then
+		USER_SWITCH_COMMAND="sudo -u $USER"
+	fi
+
+	# Declare local variable that doesn't change the $?
+	declare -I COMMAND_OUTPUT
+	COMMAND_OUTPUT=$(eval "$USER_SWITCH_COMMAND $COMMAND 2>&1")
+	local RESULT=$?
+	if [[ $PRINT_RESULT = true ]]; then
+		echo -e "$COMMAND_OUTPUT"
+	fi
+
+	return "$RESULT"
+}
+
+function safe_command() {
+	local COMMAND="$1"; shift
+	local PRINT_RESULT=${1:-false}
+
+	# Declare local variable that doesn't change the $?
+	declare -I COMMAND_OUTPUT
+	COMMAND_OUTPUT=$(eval "$COMMAND 2>&1")
+	check_returncode_with_msg $? "Failed to run: '$COMMAND' with error:\n$COMMAND_OUTPUT\n$(callstack)"
+	if [[ $PRINT_RESULT = true ]]; then
+		echo -e "$COMMAND_OUTPUT"
+	fi
+}
+
+function set_perforce_permissions() {
+	local FILES="$1"; shift
+	local OPTS="$1"
+
+	safe_command "chown $OPTS perforce:perforce $FILES"
+	safe_command "chmod $OPTS 700 $FILES"
+}
+
+function print_config_vars() {
+	show_var _GCLOUD_PROJECT true
+	show_var _GCLOUD_BUCKET true
+	show_var _GCLOUD_BACKUP_USER true
+	show_var _GCLOUD_BACKUP_ROLE true
+	show_var _MAIL_SENDER true
+	show_var _NOTIFICATION_RECIPIENTS true
+	show_var _P4_ROOT true
+	show_var _SERVER_NAME true
+	show_var _P4_JOURNAL true
+	show_var _P4_CASE true
+	show_var _P4_ARCHIVES_DIR true
+	show_var _NO_REVOKE true
+	show_var _MAINTENANCE_WANT_BACKUP true
+	show_var _MAINTENANCE_WANT_VERIFY true
+	show_var _MAINTENANCE_WANT_BACKUP_AND_VERIFY true
+	show_var _MAINTENANCE_BACKUP_TIME true
+	show_var _MAINTENANCE_VERIFY_TIME true
+	show_var _MAINTENANCE_BACKUP_AND_VERIFY_TIME true
+}
+
+function read_config_file() {
+	# Read the config file
+
+	if [[ ! -f $(get_config_file) ]]; then
+		# If the config doesn't exist, then we create it with the values that has been passed in (or default values)
+		update_config_file
+		set_perforce_permissions "$(get_config_file)"
+	fi
+
+	# Read the config file
+	_GCLOUD_PROJECT=`jq -r								'.project_id' $(get_config_file)`
+	_GCLOUD_BUCKET=`jq -r								'.bucket' $(get_config_file)`
+	_GCLOUD_BACKUP_USER=`jq -r							'.backup_user' $(get_config_file)`
+	_GCLOUD_BACKUP_ROLE=`jq -r							'.backup_role' $(get_config_file)`
+	_MAIL_SENDER=`jq -r									'.mail_sender' $(get_config_file)`
+	_MAIL_TOKEN=`jq -r									'.mail_token' $(get_config_file)`
+	_NOTIFICATION_RECIPIENTS=`jq -r						'.notification_recipients' $(get_config_file)`
+	_P4_TICKET=`jq -r									'.p4_ticket' $(get_config_file)`
+	_P4_ROOT=`jq -r										'.p4_root' $(get_config_file)`
+	_SERVER_NAME=`jq -r									'.server_name' $(get_config_file)`
+	_P4_JOURNAL=`jq -r									'.p4_journal' $(get_config_file)`
+	_P4_CASE=`jq -r										'.p4_case' $(get_config_file)`
+	_P4_ARCHIVES_DIR=`jq -r								'.p4_archives_dir' $(get_config_file)`
+	_MAINTENANCE_WANT_BACKUP=`jq -r						'.want_backup' $(get_config_file)`
+	_MAINTENANCE_WANT_VERIFY=`jq -r						'.want_verify' $(get_config_file)`
+	_MAINTENANCE_WANT_BACKUP_AND_VERIFY=`jq -r			'.want_backup_and_verify' $(get_config_file)`
+	_MAINTENANCE_BACKUP_TIME=`jq -r						'.backup_time' $(get_config_file)`
+	_MAINTENANCE_VERIFY_TIME=`jq -r						'.verify_time' $(get_config_file)`
+	_MAINTENANCE_BACKUP_AND_VERIFY_TIME=`jq -r			'.backup_and_verify_time' $(get_config_file)`
+
+	print_config_vars
+}
+
+function update_config_file() {
+	run_as "echo -e \"{
+	\\\"project_id\\\": \\\"$_GCLOUD_PROJECT\\\",
+	\\\"bucket\\\": \\\"$_GCLOUD_BUCKET\\\",
+	\\\"backup_user\\\": \\\"$_GCLOUD_BACKUP_USER\\\",
+	\\\"backup_role\\\": \\\"$_GCLOUD_BACKUP_ROLE\\\",
+	\\\"mail_sender\\\": \\\"$_MAIL_SENDER\\\",
+	\\\"mail_token\\\": \\\"$_MAIL_TOKEN\\\",
+	\\\"notification_recipients\\\": \\\"$_NOTIFICATION_RECIPIENTS\\\",
+	\\\"p4_ticket\\\": \\\"$_P4_TICKET\\\",
+	\\\"p4_root\\\": \\\"$_P4_ROOT\\\",
+	\\\"server_name\\\": \\\"$_SERVER_NAME\\\",
+	\\\"p4_journal\\\": \\\"$_P4_JOURNAL\\\",
+	\\\"p4_case\\\": \\\"$_P4_CASE\\\",
+	\\\"p4_archives_dir\\\": \\\"$_P4_ARCHIVES_DIR\\\",
+	\\\"want_backup\\\": \\\"$_MAINTENANCE_WANT_BACKUP\\\",
+	\\\"want_verify\\\": \\\"$_MAINTENANCE_WANT_VERIFY\\\",
+	\\\"want_backup_and_verify\\\": \\\"$_MAINTENANCE_WANT_BACKUP_AND_VERIFY\\\",
+	\\\"backup_time\\\": \\\"$_MAINTENANCE_BACKUP_TIME\\\",
+	\\\"verify_time\\\": \\\"$_MAINTENANCE_VERIFY_TIME\\\",
+	\\\"backup_and_verify_time\\\": \\\"$_MAINTENANCE_BACKUP_AND_VERIFY_TIME\\\"
+}\" > $(get_config_file)" "perforce"
+	set_perforce_permissions "$(get_config_file)"
+
+	print_config_vars
+}
+
+# DIRTY, ENSURE THAT WE READ VERBOSE-FLAG BEFORE READING CONFIG FILE TO SEE SETTINGS
+if [[ "$@" == *"-v "* || "$@" == *"--verbose "* ]]; then
+	_VERBOSE=1
+fi
+
+# Read config values from the maintenance_conf.json file, so that we can overwrite them if we have specified any of them
+read_config_file
+
 while true; do
 	case "$1" in
-		-n|--nightly) _NIGHTLY=1; shift ;;
-		-w|--weekly) _WEEKLY=1; shift ;;
+		-b|--backup) _BACKUP=1; shift ;;
+		--verify) _VERIFY=1; shift ;;
 		-i|--interactive) _INTERACTIVE=1; shift ;;
 		--gcloud_setup) _GCLOUD_SETUP=1; shift ;;
 		-v|--verbose) _VERBOSE=1; shift ;;
@@ -151,59 +371,49 @@ while true; do
 				"") echo "No gcloud backup user provided, exiting"; exit -1; shift 2 ;;
 				*) _GCLOUD_BACKUP_USER="$2"; shift 2 ;;
 			esac ;;
+		--want_backup)
+			case $2 in
+				"") echo "No backup setting provided, discarding parameter"; shift 2 ;;
+				*) _MAINTENANCE_WANT_BACKUP="$2"; shift 2 ;;
+			esac ;;
+		--want_verify)
+			case $2 in
+				"") echo "No verify setting provided, discarding parameter"; shift 2 ;;
+				*) _MAINTENANCE_WANT_VERIFY="$2"; shift 2 ;;
+			esac ;;
+		--want_backup_and_verify)
+			case $2 in
+				"") echo "No backup and verify setting provided, discarding parameter"; shift 2 ;;
+				*) _MAINTENANCE_WANT_BACKUP_AND_VERIFY="$2"; shift 2 ;;
+			esac ;;
+		--backup_time)
+			case $2 in
+				"") echo "No backup time provided, discarding parameter"; shift 2 ;;
+				*) _MAINTENANCE_BACKUP_TIME="$2"; shift 2 ;;
+			esac ;;
+		--verify_time)
+			case $2 in
+				"") echo "No verify time provided, discarding parameter"; shift 2 ;;
+				*) _MAINTENANCE_VERIFY_TIME="$2"; shift 2 ;;
+			esac ;;
+		--backup_and_verify_time)
+			case $2 in
+				"") echo "No backup and verify time provided, discarding parameter"; shift 2 ;;
+				*) _MAINTENANCE_BACKUP_AND_VERIFY_TIME="$2"; shift 2 ;;
+			esac ;;
 		--) shift ; break ;;
 		*) echoerr "Internal error!, received unknown token '$1'" ; exit 1 ;;
     esac
 done
 
-if [[ "$_NIGHTLY" -eq 0 && "$_WEEKLY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 && "$_INTERACTIVE" -ne 0 ]]; then
-	echoerr "Either nightly, weekly, setup, restore or weekly_setup needs to be set for the backupscript to run"
+update_config_file
+
+if [[ "$_BACKUP" -eq 0 && "$_VERIFY" -eq 0 && "$_GCLOUD_SETUP" -eq 0 && "$_SETUP" -eq 0 && "$_RESTORE" -ne 0 && "$_INTERACTIVE" -ne 0 ]]; then
+	echoerr "Either backup, verify, setup, restore or interactive needs to be set for the maintenance script to run"
 	echoerr "EXITING!"
 	exit -1
 fi
 
-# Ensure that we can quit in the middle of a function by running exit 1 if we catches the TERM signal
-trap "exit 1" TERM
-export TOP_PID=$$
-
-# Helper function to make it easier to read when we are force quitting the script
-function force_exit() {
-	# Send the TERM signal
-	kill -s TERM $TOP_PID
-}
-
-# from https://stackoverflow.com/a/62757929
-function callstack() { 
-	local i=${1:-1}; shift
-	local max_depth=${1:--1}; shift
-	local line file func skip_first
-
-	while read -r line func file < <(caller $i); do
-		if [[ "$max_depth" -ne "-1" && "$i" -ge "$max_depth" ]]; then
-			break
-		fi
-
-		echo "[$i] $file:$line $func(): $(sed -n ${line}p $file)"
-
-		((i++))
-	done
-}
-
-function verbose_log() {
-	local MESSAGE="$1"
-	if [[ "$_VERBOSE" -ne 0 ]]; then
-		echo -e "$MESSAGE"
-	fi
-}
-
-function force_exit_msg() {
-	local MESSAGE="$1"
-
-	echoerr "$MESSAGE"
-	send_mail "$MESSAGE"
-
-	force_exit
-}
 
 function is_root() {
 	local OUTPUT=`whoami`
@@ -215,33 +425,7 @@ function is_root() {
 	return 0
 }
 
-function send_mail() {
-	local MESSAGE="$1"
 
-	# Verify that we have specified the notification recipient
-	if [[ "$_NOTIFICATION_RECIPIENTS" != -1 ]]; then
-		echo -e "From: Perforce Server\nSubject: Perforce server backup failed\n\n$MESSAGE" | ssmtp $_NOTIFICATION_RECIPIENTS
-	else
-		verbose_log "No notification recipient specified, no mail sent"
-	fi
-}
-
-function get_config_file() {
-	echo "/opt/perforce/backup/maintenance_conf.json"
-}
-
-function safe_command() {
-	local COMMAND="$1"; shift
-	local PRINT_RESULT=${1:-false}
-
-	# Declare local variable that doesn't change the $?
-	declare -I COMMAND_OUTPUT
-	COMMAND_OUTPUT=$(eval "$COMMAND 2>&1")
-	check_returncode_with_msg $? "Failed to run: '$COMMAND' with error:\n$COMMAND_OUTPUT\n$(callstack)"
-	if [[ $PRINT_RESULT = true ]]; then
-		echo -e "$COMMAND_OUTPUT"
-	fi
-}
 
 function safe_command_as() {
 	local COMMAND="$1"; shift
@@ -600,14 +784,6 @@ function p4_get_server_name() {
 	echo $SERVER_NAME
 }
 
-function check_returncode_with_msg() {
-	local RETURN_CODE=$1
-	local ERROR_MESSAGE="$2"
-
-	if [[ "$RETURN_CODE" -ne 0 ]]; then
-		force_exit_msg "$ERROR_MESSAGE"
-	fi
-}
 
 # @returns 1 on yes and 0 on no
 function ask_yes_no_question() {
@@ -625,12 +801,6 @@ function ask_yes_no_question() {
 			echo -e "Please answer with y/n, yes/no\n"
 		fi
 	done
-}
-
-function show_var() {
-	local VARNAME=$1
-
-	echo -e "$VARNAME='${!VARNAME}'"
 }
 
 function from_func() {
@@ -667,14 +837,6 @@ function temporary_backup_bad_db() {
 	else
 		verbose_log "No db.* files to backup..."
 	fi
-}
-
-function set_perforce_permissions() {
-	local FILES="$1"; shift
-	local OPTS="$1"
-
-	safe_command "chown $OPTS perforce:perforce $FILES"
-	safe_command "chmod $OPTS 700 $FILES"
 }
 
 function remove_bad_db_backup() {
@@ -789,7 +951,7 @@ function wait_for_permission_propagation() {
 	wait_for_permission "storage buckets describe gs://$_GCLOUD_BUCKET" "Bucket permissions"
 }
 
-function nightly_backup() {
+function backup() {
 	# Reference: https://www.perforce.com/manuals/p4sag/Content/P4SAG/backup-procedure.html
 	require_param "_GCLOUD_PROJECT" "--gcloud_project"
 	require_param "_GCLOUD_BUCKET" "--gcloud_bucket"
@@ -867,7 +1029,7 @@ function nightly_backup() {
 	verbose_log "Nightly backup succeeded"
 }
 
-function weekly_verification() {
+function verify() {
 	require_param "_P4_TICKET" "-t|--p4_ticket"
 
 	# 1. Verify archive files
@@ -875,7 +1037,7 @@ function weekly_verification() {
 	# 2. Verify shelved files 
 	p4_run "verify -q -S //..."
 
-	verbose_log "Weekly verification succeeded"
+	verbose_log "Verification succeeded"
 }
 
 # To delete the DB-files to test it, use the following command
@@ -906,26 +1068,7 @@ function restore_db() {
 }
 
 
-function run_as() {
-	local COMMAND="$1"; shift
-	local USER="$1"; shift
-	local PRINT_RESULT=${1:-false}
 
-	local USER_SWITCH_COMMAND=""
-	if [[ "$(whoami)" != "$USER" ]]; then
-		USER_SWITCH_COMMAND="sudo -u $USER"
-	fi
-
-	# Declare local variable that doesn't change the $?
-	declare -I COMMAND_OUTPUT
-	COMMAND_OUTPUT=$(eval "$USER_SWITCH_COMMAND $COMMAND 2>&1")
-	local RESULT=$?
-	if [[ $PRINT_RESULT = true ]]; then
-		echo -e "$COMMAND_OUTPUT"
-	fi
-
-	return "$RESULT"
-}
 
 function verify_checkpoint() {
 	local CHECKPOINT_FILE=$(realpath "$1")
@@ -1113,7 +1256,6 @@ AuthUser=$_MAIL_SENDER
 AuthPass=$_MAIL_TOKEN
 FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
 
-
 	# Ensure the correct permissions for ssmtp files
 	chown root:mail /etc/ssmtp/ssmtp.conf
 	# This file contains a mail token, so only allow root to read it
@@ -1135,70 +1277,23 @@ FromLineOverride=YES" > /etc/ssmtp/ssmtp.conf
 		set_perforce_permissions  "/opt/perforce/backup" "-R"
 	fi
 
-	local MAINTENENCE_USER="perforce"
-
-	# For explaination on crontab, see https://crontab.guru/#02_1_*_*_1-5,0
-	local NIGHTLY_MAINTENENCE_TIME="2 1 * * 1-5,0"
-	local NIGHTLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly"
-	
-	# For explaination on crontab, see https://crontab.guru/#2_1_*_*_6
-	local WEEKLY_MAINTENENCE_TIME="2 1 * * 6"
-	local WEEKLY_MAINTENENCE_COMMAND="$INSTALLED_PATH --nightly --weekly"
-
 	# MAILTO="" is to disable mail sending, as we are using ssmtp in the script to send mail
 	echo 'MAILTO=""' > "/etc/cron.d/perforce_maintenance"
-	echo "$NIGHTLY_MAINTENENCE_TIME $MAINTENENCE_USER $NIGHTLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
-	echo "$WEEKLY_MAINTENENCE_TIME $MAINTENENCE_USER $WEEKLY_MAINTENENCE_COMMAND" >> "/etc/cron.d/perforce_maintenance"
+	if $_MAINTENANCE_WANT_BACKUP; then
+		echo "$_MAINTENANCE_BACKUP_TIME $_MAINTENENCE_USER $INSTALLED_PATH --backup" >> "/etc/cron.d/perforce_maintenance"
+	fi
+	if $_MAINTENANCE_WANT_VERIFY; then
+		echo "$_MAINTENANCE_VERIFY_TIME $_MAINTENENCE_USER $INSTALLED_PATH --verify" >> "/etc/cron.d/perforce_maintenance"
+	fi
+	if $_MAINTENANCE_WANT_BACKUP_AND_VERIFY; then
+		echo "$_MAINTENANCE_BACKUP_AND_VERIFY_TIME $_MAINTENENCE_USER $INSTALLED_PATH --backup -- verify" >> "/etc/cron.d/perforce_maintenance"
+	fi
 
 	safe_command "chmod 640 /etc/cron.d/perforce_maintenance"
 
 	disable_default_maintenance
 
 	verbose_log "Setup is complete"
-}
-
-function read_config_file() {
-	# Read the config file
-
-	if [[ ! -f $(get_config_file) ]]; then
-		# If the config doesn't exist, then we create it with the values that has been passed in (or default values)
-		update_config_file
-		set_perforce_permissions "$(get_config_file)"
-	fi
-
-	# Read the config file
-	_GCLOUD_PROJECT=`jq -r			'.project_id' $(get_config_file)`
-	_GCLOUD_BUCKET=`jq -r			'.bucket' $(get_config_file)`
-	_GCLOUD_BACKUP_USER=`jq -r		'.backup_user' $(get_config_file)`
-	_GCLOUD_BACKUP_ROLE=`jq -r		'.backup_role' $(get_config_file)`
-	_MAIL_SENDER=`jq -r				'.mail_sender' $(get_config_file)`
-	_MAIL_TOKEN=`jq -r				'.mail_token' $(get_config_file)`
-	_NOTIFICATION_RECIPIENTS=`jq -r	'.notification_recipients' $(get_config_file)`
-	_P4_TICKET=`jq -r				'.p4_ticket' $(get_config_file)`
-	_P4_ROOT=`jq -r					'.p4_root' $(get_config_file)`
-	_SERVER_NAME=`jq -r				'.server_name' $(get_config_file)`
-	_P4_JOURNAL=`jq -r				'.p4_journal' $(get_config_file)`
-	_P4_CASE=`jq -r					'.p4_case' $(get_config_file)`
-	_P4_ARCHIVES_DIR=`jq -r			'.p4_archives_dir' $(get_config_file)`
-}
-
-function update_config_file() {
-	run_as "echo -e \"{
-	\\\"project_id\\\": \\\"$_GCLOUD_PROJECT\\\",
-	\\\"bucket\\\": \\\"$_GCLOUD_BUCKET\\\",
-	\\\"backup_user\\\": \\\"$_GCLOUD_BACKUP_USER\\\",
-	\\\"backup_role\\\": \\\"$_GCLOUD_BACKUP_ROLE\\\",
-	\\\"mail_sender\\\": \\\"$_MAIL_SENDER\\\",
-	\\\"mail_token\\\": \\\"$_MAIL_TOKEN\\\",
-	\\\"notification_recipients\\\": \\\"$_NOTIFICATION_RECIPIENTS\\\",
-	\\\"p4_ticket\\\": \\\"$_P4_TICKET\\\",
-	\\\"p4_root\\\": \\\"$_P4_ROOT\\\",
-	\\\"server_name\\\": \\\"$_SERVER_NAME\\\",
-	\\\"p4_journal\\\": \\\"$_P4_JOURNAL\\\",
-	\\\"p4_case\\\": \\\"$_P4_CASE\\\",
-	\\\"p4_archives_dir\\\": \\\"$_P4_ARCHIVES_DIR\\\"
-}\" > $(get_config_file)" "perforce"
-	set_perforce_permissions "$(get_config_file)"
 }
 
 function interactive_update_glcoud_settings() {
@@ -1370,6 +1465,60 @@ function interactive_configure_server() {
 	_NOTIFICATION_RECIPIENTS=$NOTIFICATION_RECIPIENTS
 	update_config_file
 
+	clear
+	echo -e "First verification is run, and then backup is run if the verification succeeds. Please note that verification can take a long time on large servers"
+	echo -e "https://crontab.guru/#02_1_*_*_1-5,0 is a good help to craft the cron notation"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	echo -e "P4 Ticket [$_P4_TICKET]"
+	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
+	echo -e "Backup (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP/$_MAINTENANCE_BACKUP_TIME]"
+	echo -e "Verification (Enabled/Cron Notation) [$_MAINTENANCE_WANT_VERIFY/$_MAINTENANCE_VERIFY_TIME]"
+	ask_yes_no_question "Do you want to enable sequential backup and verication of perforce server?"
+	_MAINTENANCE_WANT_BACKUP_AND_VERIFY=$?
+	if [[ $_MAINTENANCE_WANT_BACKUP_AND_VERIFY -eq 1 ]]; then
+		read -p "Enter cron notation for when you want to run verification and then backup [$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]: " MAINTENANCE_BACKUP_AND_VERIFY_TIME
+		MAINTENANCE_BACKUP_AND_VERIFY_TIME=${MAINTENANCE_BACKUP_AND_VERIFY_TIME:-$_MAINTENANCE_BACKUP_AND_VERIFY_TIME}
+		# @todo: Verify the MAINTENANCE_BACKUP_AND_VERIFY_TIME
+		_MAINTENANCE_BACKUP_AND_VERIFY_TIME=$MAINTENANCE_BACKUP_AND_VERIFY_TIME
+	fi
+	update_config_file
+
+	clear
+	echo -e "Do you want to run a step with just backup, without any verification?"
+	echo -e "https://crontab.guru/#02_1_*_*_1-5,0 is a good help to craft the cron notation"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	echo -e "P4 Ticket [$_P4_TICKET]"
+	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
+	ask_yes_no_question "Do you want to enable backup?"
+	_MAINTENANCE_WANT_BACKUP=$?
+	if [[ $_MAINTENANCE_WANT_BACKUP -eq 1 ]]; then
+		read -p "Enter cron notation for when you want backup [$_MAINTENANCE_BACKUP_TIME]: " MAINTENANCE_BACKUP_TIME
+		MAINTENANCE_BACKUP_TIME=${MAINTENANCE_BACKUP_TIME:-$_MAINTENANCE_BACKUP_TIME}
+		# @todo: Verify the MAINTENANCE_BACKUP_TIME
+		_MAINTENANCE_BACKUP_TIME=$MAINTENANCE_BACKUP_TIME
+	fi
+	update_config_file
+
+	clear
+	echo -e "Do you want to run a step with just verification, without any backup?"
+	echo -e "https://crontab.guru/#02_1_*_*_1-5,0 is a good help to craft the cron notation"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	echo -e "P4 Ticket [$_P4_TICKET]"
+	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
+	echo -e "Backup (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP/$_MAINTENANCE_BACKUP_TIME]"
+	ask_yes_no_question "Do you want to enable verication of perforce server?"
+	_MAINTENANCE_WANT_VERIFY=$?
+	if [[ $_MAINTENANCE_WANT_VERIFY -eq 1 ]]; then
+		read -p "Enter cron notation for when you want to run verification [$_MAINTENANCE_VERIFY_TIME]: " MAINTENANCE_VERIFY_TIME
+		MAINTENANCE_VERIFY_TIME=${MAINTENANCE_VERIFY_TIME:-$_MAINTENANCE_VERIFY_TIME}
+		# @todo: Verify the MAINTENANCE_VERIFICATION_TIME
+		_MAINTENANCE_VERIFY_TIME=$MAINTENANCE_VERIFY_TIME
+	fi
+	update_config_file
+
 	setup
 }
 
@@ -1463,13 +1612,13 @@ function interactive_restore(){
 }
 
 function interactive_backup(){
-	nightly_backup
+	backup
 
 	sleep 3
 }
 
-function interactive_weekly_verification(){
-	weekly_verification
+function interactive_verification(){
+	verify
 
 	sleep 3
 }
@@ -1514,7 +1663,7 @@ function interactive(){
 			2) BAD_OPTION=$(! $IS_ROOT && echo "true" || echo "false"); interactive_configure_server ;;
 			3) BAD_OPTION=false; interactive_restore ;;
 			4) BAD_OPTION=false; interactive_backup ;;
-			5) BAD_OPTION=false; interactive_weekly_verification ;;
+			5) BAD_OPTION=false; interactive_verification ;;
 			6) BAD_OPTION=false; _VERBOSE=$([ $_VERBOSE -eq 1 ] && echo "0" || echo "1") ;;
 			7) exit 0 ;;
 			*) BAD_OPTION=true ;;
@@ -1522,9 +1671,7 @@ function interactive(){
 	done
 }
 
-## Here the script starts
-read_config_file
-
+## Here is "main()"
 
 if [[ "$_INTERACTIVE" -eq 1 ]]; then
 	interactive
@@ -1546,10 +1693,10 @@ case "$_RESTORE" in
 		restore_db_and_files ;;
 esac
 
-if [[ "$_WEEKLY" -eq 1 ]]; then
-	weekly_verification
+if [[ "$_VERIFY" -eq 1 ]]; then
+	verify
 fi
 
-if [[ "$_NIGHTLY" -eq 1 ]]; then
-	nightly_backup
+if [[ "$_BACKUP" -eq 1 ]]; then
+	backup
 fi
