@@ -3,7 +3,7 @@
 # ability to use echoerr "Error message" to print to stderr instead of stdout
 function echoerr() { echo -e "$@" 1>&2; }
 
-TEMP=$(getopt -o v,m:,b,t:,s,u:,r:,i -l want_backup:,want_verify:,want_backup_and_verify:,backup_time:,verify_time:,backup_and_verify_time:,p4_tcp_port:,p4_adapter:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,backup,verify,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
+TEMP=$(getopt -o v,m:,b,t:,s,u:,r:,i -l want_backup:,want_verify:,want_backup_and_verify:,backup_time:,verify_time:,backup_and_verify_time:,p4_port:,checkpoint_max_age:,checkpoint_min_number:,no_revoke,verbose,p4_user:,mail:,gcloud_backup_role:,gcloud_user:,gcloud_setup,gcloud_bucket:,gcloud_project:,gcloud_backup_user:,backup,verify,p4_ticket:,setup,mail_sender:,mail_token:,server_name:,restore:,p4_root:,p4_journal:,p4_windows_case,p4_archive_dir:,no_fetch_license,interactive -- "$@")
 if [ $? != 0 ] ; then echoerr "Terminating..." ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -17,8 +17,7 @@ _P4_ROOT=-1
 _P4_JOURNAL=-1
 _P4_CASE="-C0"
 _P4_ARCHIVES_DIR=-1
-_P4_TCP_PORT=1666
-_P4_ADAPTER=-1
+_P4_PORT=-1
 
 _FETCH_LICENSE=true
 _VERBOSE=0
@@ -186,6 +185,7 @@ function print_config_vars() {
 	show_var _SERVER_NAME true
 	show_var _P4_JOURNAL true
 	show_var _P4_CASE true
+	show_var _P4_PORT true
 	show_var _P4_ARCHIVES_DIR true
 	show_var _NO_REVOKE true
 	show_var _MAINTENANCE_WANT_BACKUP true
@@ -222,6 +222,7 @@ function read_config_file() {
 	_SERVER_NAME=`jq -r									'.server_name' $(get_config_file)`
 	_P4_JOURNAL=`jq -r									'.p4_journal' $(get_config_file)`
 	_P4_CASE=`jq -r										'.p4_case' $(get_config_file)`
+	_P4_PORT=`jq -r										'.p4_port' $(get_config_file)`
 	_P4_ARCHIVES_DIR=`jq -r								'.p4_archives_dir' $(get_config_file)`
 	_MAINTENANCE_WANT_BACKUP=`jq -r						'.want_backup' $(get_config_file)`
 	_MAINTENANCE_WANT_VERIFY=`jq -r						'.want_verify' $(get_config_file)`
@@ -247,6 +248,7 @@ function update_config_file() {
 	\\\"server_name\\\": \\\"$_SERVER_NAME\\\",
 	\\\"p4_journal\\\": \\\"$_P4_JOURNAL\\\",
 	\\\"p4_case\\\": \\\"$_P4_CASE\\\",
+	\\\"p4_port\\\": \\\"$_P4_PORT\\\",
 	\\\"p4_archives_dir\\\": \\\"$_P4_ARCHIVES_DIR\\\",
 	\\\"want_backup\\\": \\\"$_MAINTENANCE_WANT_BACKUP\\\",
 	\\\"want_verify\\\": \\\"$_MAINTENANCE_WANT_VERIFY\\\",
@@ -290,15 +292,10 @@ while true; do
 				"") echo "No P4ROOT provided, discarding parameter"; shift 2 ;;
 				*) _P4_ROOT="$2"; shift 2 ;;
 			esac ;;
-		--p4_tcp_port)
+		--p4_port)
 			case $2 in
-				"") echo "No tcp-port provided, discarding parameter"; shift 2 ;;
-				*) _P4_TCP_PORT="$2"; shift 2 ;;
-			esac ;;
-		--p4_adapter)
-			case $2 in
-				"") echo "No adapter provided, discarding parameter"; shift 2 ;;
-				*) _P4_ADAPTER="$2"; shift 2 ;;
+				"") echo "No p4 port provided, discarding parameter"; shift 2 ;;
+				*) _P4_PORT="$2"; shift 2 ;;
 			esac ;;
 		--checkpoint_max_age)
 			case $2 in
@@ -610,26 +607,9 @@ function get_adapter() {
 }
 
 function p4_get_port() {
-	local ETH_ADAPTER="$_P4_ADAPTER"
-	if [[ "$ETH_ADAPTER" -eq "-1" ]]; then
-		ETH_ADAPTER=$(get_adapter)
-	else
-		local EXISTING_ADAPTERS=$(get_adapter)
-		mapfile -t EXISTING_ADAPTERS_ARRAY <<< "$EXISTING_ADAPTERS"
-		if ! contains_element "$ETH_ADAPTER" "${EXISTING_ADAPTERS_ARRAY[@]}"; then
-			force_exit_msg "Non existing ethernet adapter passed in, please pass in a valid adapter with --adapter"			
-		fi
-	fi
+	require_param "_P4_PORT" "--p4_port"
 
-	local NUM_ADAPTERS=$(echo -e "$ETH_ADAPTER" | wc -l)
-
-	if [ "$NUM_ADAPTERS" -gt 1 ]; then
-		force_exit_msg "Got more than one ethernet adapter, please pass in --adapter"
-	elif [ "$NUM_ADAPTERS" -eq 0 ]; then
-		force_exit_msg "Failed to get any ethernet adapter... Check server configuration"
-	fi
-	local IP_ADDR=`ip a s $ETH_ADAPTER | grep -E -o 'inet [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | cut -d' ' -f2`
-	echo "$IP_ADDR:$_P4_TCP_PORT"
+	echo "$_P4_PORT"
 }
 
 function _p4_internal() {
@@ -1430,6 +1410,42 @@ function interactive_setup_cloud_provider() {
 	done
 }
 
+function split_string_into_array() {
+	local STRING="$1"; shift
+	local DESTINATION_VAR="$1"; shift
+	local SEPARATOR="${1:-$'\n'}"
+
+	BACKUP_IFS=$IFS
+	eval "IFS=\"$SEPARATOR\"; $DESTINATION_VAR=($STRING)"
+	IFS=$BACKUP_IFS
+}
+
+function enabled_or_disabled() {
+	local ONE_OR_ZERO=$1
+
+	if [[ "$ONE_OR_ZERO" == 1 ]]; then
+		echo "enabled"
+		return
+	fi
+	echo "disabled"
+}
+
+function suggest_p4_port() {
+	_P4_PORT=-1
+	local P4_PORT=$_P4_PORT	
+	is_root
+	if [[ $? -eq 1 && ($P4_PORT == "-1" || $P4_PORT == "") ]]; then
+		# lsof command taken from: https://www.cyberciti.biz/faq/unix-linux-check-if-port-is-in-use-command/
+		P4_PORT=$(lsof -i -P -n | grep p4d | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+')
+	fi
+	if [[ $P4_PORT == "-1" || $P4_PORT == "" ]]; then
+		local ALL_IPS=$(ifconfig | sed -En 's/127.0.0.1//;s/.*inet (addr:)?(([0-9]*\.){3}[0-9]*).*/\2/p')
+		split_string_into_array "$ALL_IPS" ALL_IPS
+		P4_PORT="${ALL_IPS[0]}:1666"
+	fi
+	echo "$P4_PORT"
+}
+
 function interactive_configure_server() {
 	if is_root -eq 0; then
 		return
@@ -1454,20 +1470,9 @@ function interactive_configure_server() {
 	update_config_file
 
 	clear
-	echo -e "P4 ticket is a ticket that's used to authenticate the SuperUser account that's used to make the backups. Preferably not a expiring ticket\n"
-	echo -e "Mail sender: [$_MAIL_SENDER]"
-	echo -e "Mail sender token [$_MAIL_TOKEN]"
-	read -p "Enter P4 Ticket [$_P4_TICKET]: " P4_TICKET
-	P4_TICKET=${P4_TICKET:-$_P4_TICKET}
-	# @todo: Verify the P4_TICKET
-	_P4_TICKET=$P4_TICKET
-	update_config_file
-
-	clear
 	echo -e "Mail notification recepients is a comma separated list of email adresses that want to receive mail when something goes wrong\n"
 	echo -e "Mail sender: [$_MAIL_SENDER]"
 	echo -e "Mail sender token [$_MAIL_TOKEN]"
-	echo -e "P4 Ticket [$_P4_TICKET]"
 	read -p "Enter Mail notification recepients [$_NOTIFICATION_RECIPIENTS]: " NOTIFICATION_RECIPIENTS
 	NOTIFICATION_RECIPIENTS=${NOTIFICATION_RECIPIENTS:-$_NOTIFICATION_RECIPIENTS}
 	# @todo: Verify the NOTIFICATION_RECIPIENTS
@@ -1475,12 +1480,41 @@ function interactive_configure_server() {
 	update_config_file
 
 	clear
+	echo -e "P4PORT is the ipaddress and port that p4d listens to. It's on the form <ip-address>:<port> eg. 192.168.0.5:1666\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
+
+	local PORT=$_P4_PORT
+	if [[ "$PORT" == "-1" || "$PORT" == "" ]]; then
+		PORT=$(suggest_p4_port)
+	fi
+	read -p "Enter P4PORT: [$PORT]: " P4_PORT
+	P4_PORT=${P4_PORT:-$PORT}
+	# @TODO: Add verification that tcp port is correct
+	_P4_PORT=$P4_PORT
+	update_config_file
+
+	clear
+	echo -e "P4 ticket is a ticket that's used to authenticate the SuperUser account that's used to make the backups. Preferably not a expiring ticket\n"
+	echo -e "Mail sender: [$_MAIL_SENDER]"
+	echo -e "Mail sender token [$_MAIL_TOKEN]"
+	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
+	echo -e "P4PORT: [$_P4_PORT]:"
+	read -p "Enter P4 Ticket [$_P4_TICKET]: " P4_TICKET
+	P4_TICKET=${P4_TICKET:-$_P4_TICKET}
+	# @todo: Verify the P4_TICKET
+	_P4_TICKET=$P4_TICKET
+	update_config_file
+
+	clear
 	echo -e "First verification is run, and then backup is run if the verification succeeds. Please note that verification can take a long time on large servers"
 	echo -e "https://crontab.guru/#02_1_*_*_1-5,0 is a good help to craft the cron notation"
 	echo -e "Mail sender: [$_MAIL_SENDER]"
 	echo -e "Mail sender token [$_MAIL_TOKEN]"
-	echo -e "P4 Ticket [$_P4_TICKET]"
 	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
+	echo -e "P4PORT: [$_P4_PORT]:"
+	echo -e "P4 Ticket [$_P4_TICKET]"
 	ask_yes_no_question "Do you want to enable sceduled backup and verication of perforce server?"
 	_MAINTENANCE_WANT_BACKUP_AND_VERIFY=$?
 	if [[ $_MAINTENANCE_WANT_BACKUP_AND_VERIFY -eq 1 ]]; then
@@ -1496,9 +1530,10 @@ function interactive_configure_server() {
 	echo -e "https://crontab.guru/#02_1_*_*_1-5,0 is a good help to craft the cron notation"
 	echo -e "Mail sender: [$_MAIL_SENDER]"
 	echo -e "Mail sender token [$_MAIL_TOKEN]"
-	echo -e "P4 Ticket [$_P4_TICKET]"
 	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
-	echo -e "Backup and verification (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP_AND_VERIFY/$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]"
+	echo -e "P4PORT: [$_P4_PORT]:"
+	echo -e "P4 Ticket [$_P4_TICKET]"
+	echo -e "Backup and verification (Enabled/Cron Notation) [$(enabled_or_disabled "$_MAINTENANCE_WANT_BACKUP_AND_VERIFY")/$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]"
 	ask_yes_no_question "Do you want to enable scheduled backup?"
 	_MAINTENANCE_WANT_BACKUP=$?
 	if [[ $_MAINTENANCE_WANT_BACKUP -eq 1 ]]; then
@@ -1514,17 +1549,18 @@ function interactive_configure_server() {
 	echo -e "https://crontab.guru/#02_1_*_*_1-5,0 is a good help to craft the cron notation"
 	echo -e "Mail sender: [$_MAIL_SENDER]"
 	echo -e "Mail sender token [$_MAIL_TOKEN]"
-	echo -e "P4 Ticket [$_P4_TICKET]"
 	echo -e "Mail notification recepients [$_NOTIFICATION_RECIPIENTS]"
-	echo -e "Backup and verification (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP_AND_VERIFY/$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]"
-	echo -e "Backup (Enabled/Cron Notation) [$_MAINTENANCE_WANT_BACKUP/$_MAINTENANCE_BACKUP_TIME]"
+	echo -e "P4PORT: [$_P4_PORT]:"
+	echo -e "P4 Ticket [$_P4_TICKET]"
+	echo -e "Backup and verification (Enabled/Cron Notation) [$(enabled_or_disabled "$_MAINTENANCE_WANT_BACKUP_AND_VERIFY")/$_MAINTENANCE_BACKUP_AND_VERIFY_TIME]"
+	echo -e "Backup (Enabled/Cron Notation) [$(enabled_or_disabled "$_MAINTENANCE_WANT_BACKUP")/$_MAINTENANCE_BACKUP_TIME]"
 	ask_yes_no_question "Do you want to scheduled enable verication of perforce server?"
 	_MAINTENANCE_WANT_VERIFY=$?
 	if [[ $_MAINTENANCE_WANT_VERIFY -eq 1 ]]; then
 		read -p "Enter cron notation for when you want to run verification [$_MAINTENANCE_VERIFY_TIME]: " MAINTENANCE_VERIFY_TIME
 		MAINTENANCE_VERIFY_TIME=${MAINTENANCE_VERIFY_TIME:-$_MAINTENANCE_VERIFY_TIME}
 		# @todo: Verify the MAINTENANCE_VERIFICATION_TIME
-		_MAINTENANCE_VERIFY_TIME=$MAINTENANCE_VERIFY_TIME
+		_MAINTENANCE_VERIFY_TIME=$MAINTE2NANCE_VERIFY_TIME
 	fi
 	update_config_file
 
